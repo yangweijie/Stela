@@ -1,0 +1,121 @@
+[workspace]
+members = [
+    "crates/stela-boot-core",
+    "crates/stela-crypto",
+    "crates/stela-cli",
+    "crates/stela-gpu-maintenance",
+    "crates/stela-dev",
+    "crates/stela-loader",
+    "crates/stela-compiler",
+    "crates/stela-drivers",
+    "crates/stela-driver-core",
+    "crates/stela-c-build",
+    "crates/stela-linux",
+    "crates/stela-driver-audio",
+    "crates/stela-driver-base",
+    "crates/stela-driver-gpu",
+    "crates/stela-driver-net",
+    "crates/stela-driver-storage",
+    "crates/stela-driver-gpu/src/metal/input",
+    "crates/stela-fingerprint",
+    "crates/stela-contracts",
+    "crates/stela-formats",
+    "crates/stela-soc-data",
+    "crates/stela-engine",
+    "crates/stela-soc",
+    "crates/stela-runtime",
+    "crates/stela-tls",
+    "xtask",
+]
+# A plain `cargo build` builds the shipped crates. `stela-dev` (research and
+# development commands) and `xtask` (development tasks, whose AArch64
+# fixtures need clang) build with `-p` or `--workspace`, as `cargo xtask
+# check` does.
+default-members = [
+    "crates/stela-boot-core",
+    "crates/stela-cli",
+    "crates/stela-gpu-maintenance",
+    "crates/stela-loader",
+    "crates/stela-compiler",
+    "crates/stela-drivers",
+    "crates/stela-driver-core",
+    "crates/stela-c-build",
+    "crates/stela-linux",
+    "crates/stela-driver-audio",
+    "crates/stela-driver-base",
+    "crates/stela-driver-gpu",
+    "crates/stela-driver-net",
+    "crates/stela-driver-storage",
+    "crates/stela-driver-gpu/src/metal/input",
+    "crates/stela-contracts",
+    "crates/stela-formats",
+    "crates/stela-soc-data",
+    "crates/stela-engine",
+    "crates/stela-soc",
+    "crates/stela-runtime",
+    "crates/stela-tls",
+]
+# The UEFI application builds for its own target with aborting panics.
+exclude = ["crates/stela-boot", "crates/stela-mesa", "third_party/smoltcp"]
+resolver = "2"
+
+[workspace.package]
+version = "0.4.2"
+edition = "2024"
+license = "GPL-2.0-or-later"
+repository = "https://github.com/tylertms/Stela"
+rust-version = "1.99"
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", default-features = false, features = ["alloc", "derive"] }
+serde_json = "1"
+rustc_apfloat = "=0.2.3"
+sha2 = "0.10"
+hex = "0.4"
+libc = "0.2"
+tempfile = "3"
+stela-boot-core = { path = "crates/stela-boot-core" }
+stela-crypto = { path = "crates/stela-crypto" }
+stela-compiler = { path = "crates/stela-compiler" }
+stela-fingerprint = { path = "crates/stela-fingerprint" }
+stela-drivers = { path = "crates/stela-drivers" }
+stela-contracts = { path = "crates/stela-contracts" }
+stela-formats = { path = "crates/stela-formats" }
+stela-engine = { path = "crates/stela-engine" }
+stela-soc-data = { path = "crates/stela-soc-data" }
+stela-soc = { path = "crates/stela-soc" }
+stela-runtime = { path = "crates/stela-runtime" }
+stela-tls = { path = "crates/stela-tls" }
+stela-loader = { path = "crates/stela-loader" }
+stela-cli = { path = "crates/stela-cli" }
+stela-gpu-maintenance = { path = "crates/stela-gpu-maintenance" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+undocumented_unsafe_blocks = "warn"
+
+# Backtraces keep their files and lines; full debug information made a
+# test build's target directory 60 % larger and its links slower.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+# Large restore images spend substantial time in these crates in debug builds.
+# Keep Stela itself debuggable while using optimized hash compression code.
+[profile.dev.package.sha1]
+opt-level = 3
+
+[profile.dev.package.sha2]
+opt-level = 3
+
+[patch.crates-io]
+# Canonical vendored upstream source plus the reviewed SLAAC corrections.
+smoltcp = { path = "third_party/smoltcp" }

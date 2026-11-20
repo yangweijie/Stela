@@ -1,0 +1,670 @@
+//! FRECPS/FRSQRTS: exact-product SSE2, FMA3, or widened arithmetic for half;
+//! S/D FRECPS and FRSQRTS with FMA3 and FPCR.AH clear for every input.
+use super::super::isa::ShiftOpcode;
+use super::numerical::{
+    ArithmeticOpcode, Condition, FusedOpcode, INPUT_MINIMUM_EXPONENT, MINIMUM_EXPONENT_VECTOR,
+    RESULT_MINIMUM_EXPONENT, branch, clear_scalar, commit_ah0_inexact, emit_fma, emit_opcode_to,
+    environment_alternative_nearest, exponent_range, guard_ah0_exceptions,
+    prepare_vector_input_range, prepare_vector_result_range, read_numerical_vector,
+    reject_other_status, reject_product_status, resolve, restore_environment,
+    restore_environment_with_product, save_product_status, test_control, vector_exponent_range,
+};
+use super::numerical::{
+    NanRegisters, clear_environment_status, commit_flush_status, commit_invalid_lanes,
+    commit_rounded_status, environment, float_lanes, flush_subnormal_lanes, jump, merge_nans,
+    select_input_nans,
+};
+use super::{Host, commit, half, packed};
+use crate::x86_64::asm::{Alu, Code, FloatOp, Gpr, Mem, Rm, Size};
+use crate::{
+    GuestAddress, TargetCpu,
+    aarch64::{
+        floating::{FPCR_AH, FPCR_FIZ, FPCR_FZ, FPCR_NEP, Format},
+        simd::{
+            arithmetic::Shape,
+            refinement::{Kind, Operand},
+        },
+    },
+    block::ExitKind,
+};
+use Gpr::{R9, R10, Rax, Rcx, Rsp};
+use alloc::vec::Vec;
+
+const LEFT: u8 = 0;
+const RIGHT: u8 = 1;
+const SAVED_SINGLE_LEFT: u8 = 2;
+const SAVED_SINGLE_RIGHT: u8 = 5;
+const SAVED_SINGLE_CONSTANT: u8 = 2;
+const FIRST_SINGLE_PAIR: u8 = 3;
+const SPLIT_SINGLE_LEFT: u8 = 7;
+const HALF_CONSTANT: u8 = 5;
+const CONSTANT: u8 = 6;
+const ORIGINAL_LEFT: u8 = 7;
+const SIGN_BITS: u32 = 1;
+
+// Fixed registers for the cold Single-to-Double refinement path. The private
+// environment uses the same four-slot scratch layout as numerical.rs.
+const MXCSR_SAVED_SLOT: u8 = 0;
+const MXCSR_CONTROL_SLOT: u8 = 4;
+const MXCSR_STATUS_SLOT: u8 = 8;
+const MXCSR_PRODUCT_SLOT: u8 = 12;
+const MXCSR_STACK_BYTES: u8 = 16;
+
+/// `[rsp + offset]` in the private environment frame.
+fn slot(offset: u8) -> Mem {
+    Mem::base(Rsp, offset.into())
+}
+
+fn constant(code: &mut Code, format: Format, kind: Kind, destination: u8) {
+    packed(code, Host::EqualDword, destination, destination);
+    let (right, left) = if format == Format::Single {
+        (ShiftOpcode::RightDword, ShiftOpcode::LeftDword)
+    } else {
+        (ShiftOpcode::RightQword, ShiftOpcode::LeftQword)
+    };
+    let (right_bits, left_bits) = match kind {
+        Kind::Reciprocal => (format.bits() - SIGN_BITS, format.bits() - SIGN_BITS * 2),
+        Kind::ReciprocalSquareRoot => (
+            format.fraction_bits() + SIGN_BITS,
+            format.fraction_bits() - SIGN_BITS,
+        ),
+    };
+    right.emit(code, destination, right_bits as u8);
+    left.emit(code, destination, left_bits as u8);
+}
+
+fn normal_sources(code: &mut Code, operand: &Operand, helper: &mut Vec<usize>) {
+    let minimum = if operand.kind == Kind::ReciprocalSquareRoot {
+        RESULT_MINIMUM_EXPONENT
+    } else {
+        INPUT_MINIMUM_EXPONENT
+    };
+    if operand.shape == Shape::Scalar {
+        for (source, minimum) in [(RIGHT, INPUT_MINIMUM_EXPONENT), (LEFT, minimum)] {
+            exponent_range(code, operand.format, source, minimum);
+            helper.push(branch(code, Condition::AboveOrEqual));
+        }
+    } else {
+        prepare_vector_input_range(code, operand.format);
+        vector_exponent_range(code, operand.format, operand.shape, RIGHT);
+        helper.push(branch(code, Condition::NotZero));
+        if operand.kind == Kind::ReciprocalSquareRoot {
+            prepare_vector_result_range(code);
+        }
+        vector_exponent_range(code, operand.format, operand.shape, LEFT);
+        helper.push(branch(code, Condition::NotZero));
+    }
+}
+
+fn prehalve(code: &mut Code, operand: &Operand) {
+    if operand.format == Format::Single && operand.shape == Shape::Scalar {
+        let mut asm = code.asm();
+        asm.movd_from_xmm(Rax, LEFT);
+        asm.alu_accumulator_imm32(
+            Alu::Sub,
+            Size::Dword,
+            (1u32 << operand.format.fraction_bits()) as i32,
+        );
+        asm.movd_to_xmm(LEFT, Rax);
+        return;
+    }
+    if operand.shape == Shape::Scalar {
+        prepare_vector_result_range(code);
+    }
+    let (shift, subtract) = if operand.format == Format::Single {
+        (ShiftOpcode::LeftDword, Host::SubDword)
+    } else {
+        (ShiftOpcode::LeftQword, Host::SubQword)
+    };
+    shift.emit(
+        code,
+        MINIMUM_EXPONENT_VECTOR,
+        operand.format.fraction_bits() as u8,
+    );
+    packed(code, subtract, LEFT, MINIMUM_EXPONENT_VECTOR);
+    if operand.shape == Shape::Vector64 {
+        packed(code, Host::MoveQword, LEFT, LEFT);
+    }
+}
+
+/// The first pair's target PE must not contaminate the second pair's exact
+/// Double-affine status. R9D/R10D keep wide/target flags across the reset.
+fn widen_single_pairs(code: &mut Code) {
+    packed(code, Host::MoveAligned, SPLIT_SINGLE_LEFT, LEFT);
+    packed(code, Host::MoveAligned, SAVED_SINGLE_RIGHT, RIGHT);
+    packed(code, Host::MoveAligned, SAVED_SINGLE_CONSTANT, CONSTANT);
+    let mut asm = code.asm();
+    asm.cvtps2pd(LEFT, Rm::Xmm(SPLIT_SINGLE_LEFT));
+    asm.cvtps2pd(RIGHT, Rm::Xmm(SAVED_SINGLE_RIGHT));
+    widened_product(code, Shape::Vector128);
+    save_product_status(code);
+    let mut asm = code.asm();
+    asm.mov_load(Size::Dword, R9, slot(MXCSR_PRODUCT_SLOT));
+    asm.cvtpd2ps(CONSTANT, Rm::Xmm(CONSTANT));
+    asm.stmxcsr(slot(MXCSR_STATUS_SLOT));
+    asm.mov_load(Size::Dword, R10, slot(MXCSR_STATUS_SLOT));
+    asm.ldmxcsr(slot(MXCSR_CONTROL_SLOT));
+    packed(code, Host::MoveAligned, FIRST_SINGLE_PAIR, CONSTANT);
+    let mut asm = code.asm();
+    asm.movhlps(LEFT, Rm::Xmm(SPLIT_SINGLE_LEFT));
+    asm.movhlps(RIGHT, Rm::Xmm(SAVED_SINGLE_RIGHT));
+    asm.cvtps2pd(LEFT, Rm::Xmm(LEFT));
+    asm.cvtps2pd(RIGHT, Rm::Xmm(RIGHT));
+    emit_opcode_to(
+        code,
+        Format::Double,
+        Shape::Vector128,
+        ArithmeticOpcode::Multiply,
+        LEFT,
+        RIGHT,
+    );
+    packed(code, Host::MoveAligned, CONSTANT, SAVED_SINGLE_CONSTANT);
+    emit_opcode_to(
+        code,
+        Format::Double,
+        Shape::Vector128,
+        ArithmeticOpcode::Subtract,
+        CONSTANT,
+        LEFT,
+    );
+    save_product_status(code);
+    let mut asm = code.asm();
+    asm.mov_load(Size::Dword, Rax, slot(MXCSR_PRODUCT_SLOT));
+    asm.alu(Alu::Or, Size::Dword, Rax, R9);
+    asm.mov_store(Size::Dword, slot(MXCSR_PRODUCT_SLOT), Rax);
+    asm.cvtpd2ps(CONSTANT, Rm::Xmm(CONSTANT));
+    asm.stmxcsr(slot(MXCSR_STATUS_SLOT));
+    asm.ldmxcsr(slot(MXCSR_SAVED_SLOT));
+    asm.mov_load(Size::Dword, Rax, slot(MXCSR_PRODUCT_SLOT));
+    asm.mov_load(Size::Dword, Rcx, slot(MXCSR_STATUS_SLOT));
+    asm.alu(Alu::Or, Size::Dword, Rcx, R10);
+    asm.alu_imm8(Alu::Add, Size::Qword, Rsp, MXCSR_STACK_BYTES as i8);
+    asm.movlhps(FIRST_SINGLE_PAIR, Rm::Xmm(CONSTANT));
+    packed(code, Host::MoveAligned, CONSTANT, FIRST_SINGLE_PAIR);
+}
+
+fn widened_product(code: &mut Code, shape: Shape) {
+    emit_opcode_to(
+        code,
+        Format::Double,
+        shape,
+        ArithmeticOpcode::Multiply,
+        LEFT,
+        RIGHT,
+    );
+    emit_opcode_to(
+        code,
+        Format::Double,
+        shape,
+        ArithmeticOpcode::Subtract,
+        CONSTANT,
+        LEFT,
+    );
+}
+
+/// Runs only after the exact-product path has restored the caller's
+/// environment. The double product of widened singles is exact (at most 48
+/// bits), and the affine step must also be exact before the single final
+/// rounding.
+fn widened_single_fallback(code: &mut Code, operand: &Operand, helper_start: usize) {
+    packed(code, Host::MoveAligned, LEFT, SAVED_SINGLE_LEFT);
+    constant(code, Format::Double, operand.kind, CONSTANT);
+    environment_alternative_nearest(code);
+    match operand.shape {
+        Shape::Scalar => {
+            let mut asm = code.asm();
+            asm.cvtss2sd(LEFT, Rm::Xmm(LEFT));
+            asm.cvtss2sd(RIGHT, Rm::Xmm(RIGHT));
+            widened_product(code, Shape::Scalar);
+            save_product_status(code);
+            code.asm().cvtsd2ss(CONSTANT, Rm::Xmm(CONSTANT));
+            restore_environment_with_product(code);
+        }
+        Shape::Vector64 => {
+            let mut asm = code.asm();
+            asm.cvtps2pd(LEFT, Rm::Xmm(LEFT));
+            asm.cvtps2pd(RIGHT, Rm::Xmm(RIGHT));
+            widened_product(code, Shape::Vector128);
+            save_product_status(code);
+            code.asm().cvtpd2ps(CONSTANT, Rm::Xmm(CONSTANT));
+            restore_environment_with_product(code);
+        }
+        Shape::Vector128 => widen_single_pairs(code),
+    }
+    let wide_inexact = reject_product_status(code);
+    resolve(code, wide_inexact, helper_start);
+    let invalid_target = reject_other_status(code);
+    resolve(code, invalid_target, helper_start);
+}
+
+fn emit_single_double(code: &mut Code, operand: &Operand, pc: GuestAddress, target: TargetCpu) {
+    let native_fma = target.supports(TargetCpu::Fma);
+    if native_fma {
+        code.asm().vzeroupper();
+    }
+    let mut helper = Vec::new();
+    guard_ah0_exceptions(code, &mut helper);
+    read_numerical_vector(code, operand.shape, operand.left, LEFT);
+    read_numerical_vector(code, operand.shape, operand.right, RIGHT);
+    let merge = if operand.shape == Shape::Scalar
+        && (!native_fma || operand.kind == Kind::ReciprocalSquareRoot)
+    {
+        packed(code, Host::MoveAligned, ORIGINAL_LEFT, LEFT);
+        ORIGINAL_LEFT
+    } else {
+        // VEX scalar FMA keeps the destination's upper XMM bits, not the
+        // addend's (Intel SDM, VFNMADD132SS/SD). LEFT still holds Vn.
+        LEFT
+    };
+    let rounded = native_fma.then(|| match operand.kind {
+        Kind::Reciprocal => rounded_reciprocal_step(code, operand, target),
+        Kind::ReciprocalSquareRoot => rounded_square_root_step(code, operand, target),
+    });
+    normal_sources(code, operand, &mut helper);
+    if operand.kind == Kind::ReciprocalSquareRoot {
+        prehalve(code, operand);
+    }
+    constant(code, operand.format, operand.kind, CONSTANT);
+    environment_alternative_nearest(code);
+    let mut widen_product = None;
+    let result = if native_fma {
+        emit_fma(
+            code,
+            operand.format,
+            operand.shape,
+            FusedOpcode::NegativeMultiplyAdd,
+            target,
+        );
+        restore_environment(code);
+        LEFT
+    } else {
+        if operand.format == Format::Single {
+            packed(code, Host::MoveAligned, SAVED_SINGLE_LEFT, LEFT);
+        }
+        emit_opcode_to(
+            code,
+            operand.format,
+            operand.shape,
+            ArithmeticOpcode::Multiply,
+            LEFT,
+            RIGHT,
+        );
+        save_product_status(code);
+        emit_opcode_to(
+            code,
+            operand.format,
+            operand.shape,
+            ArithmeticOpcode::Subtract,
+            CONSTANT,
+            LEFT,
+        );
+        restore_environment_with_product(code);
+        let inexact_product = reject_product_status(code);
+        if operand.format == Format::Single {
+            widen_product = Some(inexact_product);
+        } else {
+            helper.push(inexact_product);
+        }
+        CONSTANT
+    };
+    helper.push(reject_other_status(code));
+    // A finite Single/Double refinement's nonzero exact result is normal.
+    // Exact cancellation follows the installed Arm rounding mode's zero sign.
+    // The kept status guards reject overflow and other exceptional results.
+    let success = jump(code);
+    let helper_start = code.len();
+    super::super::block::direct_exit(code, pc, ExitKind::FloatingPoint);
+    if let Some(patch) = widen_product {
+        let wide_start = code.len();
+        resolve(code, patch, wide_start);
+        widened_single_fallback(code, operand, helper_start);
+    }
+    let success_start = code.len();
+    for patch in helper {
+        resolve(code, patch, helper_start);
+    }
+    resolve(code, success, success_start);
+    commit_ah0_inexact(code);
+    if let Some(rounded) = rounded {
+        let rounded_start = code.len();
+        resolve(code, rounded, rounded_start);
+    }
+    if operand.shape == Shape::Scalar {
+        if merge != result {
+            if operand.format == Format::Single {
+                Host::MoveScalarSingle
+            } else {
+                Host::MoveScalarDouble
+            }
+            .register(code, merge, result, TargetCpu::Baseline);
+        }
+        test_control(code, FPCR_NEP);
+        let merging = branch(code, Condition::NotZero);
+        clear_scalar(code, operand.format, merge);
+        let end = code.len();
+        resolve(code, merging, end);
+        commit(code, operand.destination, merge);
+    } else {
+        if operand.shape == Shape::Vector64 {
+            packed(code, Host::MoveQword, result, result);
+        }
+        commit(code, operand.destination, result);
+    }
+}
+
+/// [`rounded_reciprocal_step`]'s NaN registers, apart from LEFT, RIGHT and
+/// CONSTANT.
+const NAN_REGISTERS: NanRegisters = NanRegisters {
+    selected: 2,
+    inputs: 3,
+    invalid: 4,
+    mask: 5,
+    temporary: 7,
+};
+const FLUSH_SCRATCH: [u8; 4] = [2, 3, 4, 5];
+const SCRATCH: u8 = 7;
+
+/// S/D FRECPS with FMA3 and FPCR.AH clear, for every input: FZ or FIZ flush
+/// subnormal inputs first (FZ raising IDC); Arm's FPMulAdd(2, -Vn, Vm) is
+/// one host FMA in Arm's rounding, whose status is FPSR's (a result is
+/// never tiny: a nonzero 2 - Vn*Vm is a multiple of a product of two ulps
+/// far above the minimum normal), infinities and zeros included. A NaN
+/// propagates by Arm's rules from the negated Vn and Vm
+/// ([`select_input_nans`], [`merge_nans`]); infinity times zero, the only
+/// invalid product, gives 2 without IOC. Leaves the result in LEFT, whose
+/// other bits stay for a scalar, and returns the jump past the commit's
+/// status; AH continues past it.
+fn rounded_reciprocal_step(code: &mut Code, operand: &Operand, target: TargetCpu) -> usize {
+    let (format, shape) = (operand.format, operand.shape);
+    code.asm().alu(Alu::Xor, Size::Dword, Gpr::R11, Gpr::R11);
+    test_control(code, FPCR_AH);
+    let alternative = branch(code, Condition::NotZero);
+    test_control(code, FPCR_FZ | FPCR_FIZ);
+    let unflushed = branch(code, Condition::Zero);
+    for source in [LEFT, RIGHT] {
+        flush_subnormal_lanes(code, format, shape, source, FLUSH_SCRATCH);
+    }
+    let flushed = code.len();
+    resolve(code, unflushed, flushed);
+    // Arm negates Vn before its NaN selection: only the active lanes, so
+    // that a scalar keeps Vn's other bits.
+    if shape == Shape::Scalar {
+        let mut asm = code.asm();
+        asm.mov_imm64(Rax, format.sign_mask());
+        asm.movq_to_xmm(SCRATCH, Rax);
+    } else {
+        packed(code, Host::EqualDword, SCRATCH, SCRATCH);
+        let shift = if format == Format::Single {
+            ShiftOpcode::LeftDword
+        } else {
+            ShiftOpcode::LeftQword
+        };
+        shift.emit(code, SCRATCH, (format.bits() - SIGN_BITS) as u8);
+    }
+    packed(code, Host::Xor, LEFT, SCRATCH);
+    environment(code);
+    select_input_nans(code, format, shape, &[LEFT, RIGHT], NAN_REGISTERS);
+    constant(code, format, Kind::Reciprocal, CONSTANT);
+    emit_fma(code, format, shape, FusedOpcode::MultiplyAdd, target);
+    merge_nans(code, format, shape, LEFT, NAN_REGISTERS);
+    // Infinity times zero: 2 (CONSTANT), and no IOC.
+    packed(code, Host::MoveAligned, SCRATCH, NAN_REGISTERS.mask);
+    packed(code, Host::AndNot, SCRATCH, LEFT);
+    packed(code, Host::And, CONSTANT, NAN_REGISTERS.mask);
+    packed(code, Host::Or, SCRATCH, CONSTANT);
+    if shape == Shape::Scalar {
+        let lane = if format == Format::Single {
+            Host::MoveScalarSingle
+        } else {
+            Host::MoveScalarDouble
+        };
+        lane.register(code, LEFT, SCRATCH, TargetCpu::Baseline);
+    } else {
+        packed(code, Host::MoveAligned, LEFT, SCRATCH);
+    }
+    packed(
+        code,
+        Host::AndNot,
+        NAN_REGISTERS.mask,
+        NAN_REGISTERS.invalid,
+    );
+    restore_environment(code);
+    commit_flush_status(code);
+    commit_invalid_lanes(code, format, shape, NAN_REGISTERS.mask);
+    commit_rounded_status(code);
+    let done = jump(code);
+    let alternative_start = code.len();
+    resolve(code, alternative, alternative_start);
+    done
+}
+
+/// [`rounded_square_root_step`]'s NaN registers: ORIGINAL_LEFT keeps a
+/// scalar's Vn for the merge.
+const SQUARE_ROOT_NAN_REGISTERS: NanRegisters = NanRegisters {
+    selected: 2,
+    inputs: 3,
+    invalid: 4,
+    mask: 5,
+    temporary: CONSTANT,
+};
+
+/// `bits` in every S or D lane of `xmm`. Clobbers RAX.
+fn splat(code: &mut Code, format: Format, xmm: u8, bits: u64) {
+    code.asm().mov_imm64(Rax, bits);
+    packed(code, Host::MoveGprQword, xmm, Rax as u8);
+    if format == Format::Single {
+        super::shuffle(code, xmm, xmm, 0);
+    } else {
+        packed(code, Host::UnpackLowQword, xmm, xmm);
+    }
+}
+
+/// `destination` = all ones in each S/D lane of `source` whose magnitude is
+/// finite and at least twice the minimum normal, so that halving it by an
+/// exponent decrement is exact. Clobbers `scratch` and RAX.
+fn halvable_lanes(code: &mut Code, format: Format, destination: u8, source: u8, scratch: [u8; 2]) {
+    const LESS: u8 = 1;
+    const LESS_EQUAL: u8 = 2;
+    let lanes = float_lanes(format, Shape::Vector128);
+    let [lower, upper] = scratch;
+    packed(code, Host::EqualDword, destination, destination);
+    if format == Format::Single {
+        ShiftOpcode::RightDword.emit(code, destination, SIGN_BITS as u8);
+    } else {
+        ShiftOpcode::RightQword.emit(code, destination, SIGN_BITS as u8);
+    }
+    packed(code, Host::And, destination, source);
+    splat(code, format, lower, 2 << format.fraction_bits());
+    code.asm()
+        .float_compare(lanes, lower, Rm::Xmm(destination), LESS_EQUAL);
+    splat(code, format, upper, format.exponent_mask());
+    code.asm()
+        .float_compare(lanes, destination, Rm::Xmm(upper), LESS);
+    packed(code, Host::And, destination, lower);
+}
+
+/// S/D FRSQRTS with FMA3 and FPCR.AH clear, for every input: FZ or FIZ
+/// flush subnormal inputs first (FZ raising IDC). Arm's (3 - Vn*Vm) / 2,
+/// rounded once, is FPMulAdd(1.5, -Vn/2, Vm) when halving an operand is
+/// exact: Vn's, or else Vm's, decrementing its exponent. When neither is
+/// halvable (each below twice the minimum normal, or a zero, an infinity
+/// or a NaN), a finite nonzero Vn scales by 2^(fraction bits + 2) first:
+/// a product of two such values is far below 1.5's ulp, so only its sign
+/// and being nonzero round, which the scale keeps. A NaN propagates by
+/// Arm's rules from the negated Vn and Vm ([`select_input_nans`],
+/// [`merge_nans`]); infinity times zero gives 1.5 without IOC, and an
+/// infinity times a nonzero value the host's signed infinity. A result is
+/// never tiny. Leaves the result in LEFT and returns the jump past the
+/// commit's status; AH continues past it.
+fn rounded_square_root_step(code: &mut Code, operand: &Operand, target: TargetCpu) -> usize {
+    const ORDERED: u8 = 7;
+    let (format, shape) = (operand.format, operand.shape);
+    let lanes = float_lanes(format, Shape::Vector128);
+    let [a, b, halve_right, halve_left, mixed] = [2, 3, 4, 5, CONSTANT];
+    code.asm().alu(Alu::Xor, Size::Dword, Gpr::R11, Gpr::R11);
+    test_control(code, FPCR_AH);
+    let alternative = branch(code, Condition::NotZero);
+    test_control(code, FPCR_FZ | FPCR_FIZ);
+    let unflushed = branch(code, Condition::Zero);
+    for source in [LEFT, RIGHT] {
+        flush_subnormal_lanes(code, format, shape, source, FLUSH_SCRATCH);
+    }
+    let flushed = code.len();
+    resolve(code, unflushed, flushed);
+    // Arm negates Vn before its NaN selection.
+    splat(code, format, a, format.sign_mask());
+    packed(code, Host::Xor, LEFT, a);
+    environment(code);
+    halvable_lanes(code, format, halve_left, LEFT, [a, b]);
+    halvable_lanes(code, format, mixed, RIGHT, [a, b]);
+    packed(code, Host::MoveAligned, halve_right, halve_left);
+    packed(code, Host::AndNot, halve_right, mixed);
+    // `mixed`: the non-NaN Vn lanes with neither operand halvable.
+    packed(code, Host::MoveAligned, mixed, halve_left);
+    packed(code, Host::Or, mixed, halve_right);
+    packed(code, Host::MoveAligned, b, LEFT);
+    code.asm().float_compare(lanes, b, Rm::Xmm(b), ORDERED);
+    packed(code, Host::AndNot, mixed, b);
+    splat(
+        code,
+        format,
+        b,
+        u64::from(format.exponent_bias() + format.fraction_bits() + 2) << format.fraction_bits(),
+    );
+    code.asm().float(FloatOp::Mul, lanes, b, Rm::Xmm(LEFT));
+    packed(code, Host::MoveAligned, a, mixed);
+    packed(code, Host::And, a, b);
+    packed(code, Host::AndNot, mixed, LEFT);
+    packed(code, Host::Or, mixed, a);
+    packed(code, Host::MoveAligned, LEFT, mixed);
+    halvable_lanes(code, format, halve_left, LEFT, [a, b]);
+    // Halve by an exponent decrement.
+    let subtract = if format == Format::Single {
+        Host::SubDword
+    } else {
+        Host::SubQword
+    };
+    splat(code, format, a, 1 << format.fraction_bits());
+    packed(code, Host::MoveAligned, b, a);
+    packed(code, Host::And, b, halve_left);
+    packed(code, subtract, LEFT, b);
+    packed(code, Host::And, a, halve_right);
+    packed(code, subtract, RIGHT, a);
+    select_input_nans(
+        code,
+        format,
+        shape,
+        &[LEFT, RIGHT],
+        SQUARE_ROOT_NAN_REGISTERS,
+    );
+    constant(code, format, Kind::ReciprocalSquareRoot, CONSTANT);
+    // The scale's status is not the guest's.
+    clear_environment_status(code);
+    emit_fma(code, format, shape, FusedOpcode::MultiplyAdd, target);
+    merge_nans(code, format, shape, LEFT, SQUARE_ROOT_NAN_REGISTERS);
+    // Infinity times zero: 1.5, and no IOC.
+    let NanRegisters {
+        selected: kept,
+        invalid,
+        mask,
+        ..
+    } = SQUARE_ROOT_NAN_REGISTERS;
+    constant(code, format, Kind::ReciprocalSquareRoot, CONSTANT);
+    packed(code, Host::MoveAligned, kept, mask);
+    packed(code, Host::AndNot, kept, LEFT);
+    packed(code, Host::And, CONSTANT, mask);
+    packed(code, Host::Or, kept, CONSTANT);
+    packed(code, Host::MoveAligned, LEFT, kept);
+    packed(code, Host::AndNot, mask, invalid);
+    restore_environment(code);
+    commit_flush_status(code);
+    commit_invalid_lanes(code, format, shape, mask);
+    commit_rounded_status(code);
+    let done = jump(code);
+    let alternative_start = code.len();
+    resolve(code, alternative, alternative_start);
+    done
+}
+
+fn emit_half(code: &mut Code, operand: &Operand, pc: GuestAddress) {
+    let mut helper = Vec::new();
+    let mut rollback = Vec::new();
+    guard_ah0_exceptions(code, &mut helper);
+    read_numerical_vector(code, operand.shape, operand.left, LEFT);
+    read_numerical_vector(code, operand.shape, operand.right, RIGHT);
+    if operand.shape == Shape::Scalar {
+        packed(code, Host::MoveAligned, ORIGINAL_LEFT, LEFT);
+    }
+    prepare_vector_input_range(code, Format::Half);
+    for source in [LEFT, RIGHT] {
+        vector_exponent_range(code, Format::Half, operand.shape, source);
+        helper.push(branch(code, Condition::NotZero));
+    }
+    half::allocate_frame(code);
+    let scale = if operand.kind == Kind::ReciprocalSquareRoot {
+        half::LeftScale::Halved
+    } else {
+        half::LeftScale::Identity
+    };
+    half::set_biases(code, scale);
+    constant(code, Format::Double, operand.kind, HALF_CONSTANT);
+    let loop_start = half::start_lanes(code);
+    half::widen_lane(code);
+    // A Half product uses at most 22 significant bits. FRSQRTS prehalves
+    // the widened left operand exactly and subtracts its product from 1.5.
+    // Both refinement expressions need at most 51 bits, so Double arithmetic
+    // is exact under every caller environment. Only one active lane executes.
+    emit_opcode_to(
+        code,
+        Format::Double,
+        Shape::Scalar,
+        ArithmeticOpcode::Multiply,
+        LEFT,
+        RIGHT,
+    );
+    packed(code, Host::MoveAligned, CONSTANT, HALF_CONSTANT);
+    emit_opcode_to(
+        code,
+        Format::Double,
+        Shape::Scalar,
+        ArithmeticOpcode::Subtract,
+        CONSTANT,
+        LEFT,
+    );
+    half::pack_lane(
+        code,
+        &mut rollback,
+        half::RoundingPolicy::AhNearestEven,
+        half::ResultSign::Preserve,
+    );
+    half::finish_lanes(
+        code,
+        operand.shape.lane_count(Format::Half) as u8,
+        loop_start,
+        &helper,
+        &rollback,
+        pc,
+    );
+    test_control(code, FPCR_AH);
+    let suppressed = branch(code, Condition::NotZero);
+    half::commit_inexact(code);
+    let status_done = code.len();
+    resolve(code, suppressed, status_done);
+    if operand.shape == Shape::Scalar {
+        half::merge_scalar(code);
+    }
+    commit(code, operand.destination, LEFT);
+}
+
+pub(in crate::x86_64) fn emit(
+    code: &mut Code,
+    operand: &Operand,
+    pc: GuestAddress,
+    target: TargetCpu,
+) {
+    if operand.format == Format::Half {
+        emit_half(code, operand, pc);
+    } else {
+        emit_single_double(code, operand, pc, target);
+    }
+}

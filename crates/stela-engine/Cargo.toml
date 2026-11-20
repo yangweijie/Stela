@@ -1,0 +1,38 @@
+[package]
+name = "stela-engine"
+version.workspace = true
+edition.workspace = true
+license = "GPL-2.0-or-later AND BSD-3-Clause"
+description = "Execution of translated ARM64 code: code cache, dispatch, guest memory and system state"
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = ["std"]
+test-support = []
+native-profile = ["stela-contracts/native-profile"]
+std = ["serde/std", "serde_json/std", "stela-compiler/std", "stela-contracts/std", "stela-formats/std", "dep:tempfile", "dep:libc"]
+
+[dependencies]
+serde.workspace = true
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+tempfile = { workspace = true, optional = true }
+libc = { workspace = true, optional = true }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
+stela-compiler = { path = "../stela-compiler", default-features = false }
+stela-contracts = { path = "../stela-contracts", default-features = false }
+stela-crypto = { path = "../stela-crypto" }
+stela-formats = { path = "../stela-formats", default-features = false }
+
+[build-dependencies]
+stela-fingerprint = { path = "../stela-fingerprint" }
+
+[dev-dependencies]
+anyhow.workspace = true
+stela-compiler = { path = "../stela-compiler", features = ["test-support"] }
+stela-contracts = { path = "../stela-contracts", features = ["test-support"] }

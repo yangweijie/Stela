@@ -1,0 +1,220 @@
+/* The gate call, failures and the command stream. */
+#include "Bundle.h"
+
+#define PAGE 0x4000u
+
+/* Maps each page of `span`. Touching an output keeps what it holds. */
+static void touch(StelaSpan span, bool write)
+{
+	if (span.length == 0) {
+		return;
+	}
+	uint64_t last = span.address + span.length - 1;
+	for (uint64_t page = span.address; page <= last; page = (page & ~(uint64_t)(PAGE - 1)) + PAGE) {
+		if (write) {
+			__atomic_fetch_or((uint8_t *)page, 0, __ATOMIC_RELAXED);
+		} else {
+			(void)*(volatile uint8_t *)page;
+		}
+	}
+}
+
+/* Tries for a span the service cannot reach. The pager takes back a page at
+ * most a few times; past this, mapping it again will not help. */
+#define MAX_UNMAPPED 1024u
+
+/* Tries for a call the service never read whose gate names no fault. */
+#define MAX_UNREAD 16u
+
+/* Fails a call whose memory stays out of reach, naming what it could not map. */
+static void report_unreachable(uint32_t operation, StelaSpans spans, StelaFailure *failure)
+{
+	NSMutableString *named = [NSMutableString new];
+	for (size_t i = 0; i < spans.read_count; i++) {
+		[named appendFormat:@" read %llx+%llx", spans.reads[i].address, spans.reads[i].length];
+	}
+	for (size_t i = 0; i < spans.write_count; i++) {
+		[named appendFormat:@" write %llx+%llx", spans.writes[i].address, spans.writes[i].length];
+	}
+	NSString *what = [NSString stringWithFormat:@"operation %u, unreachable after %u tries:%@", operation,
+						    MAX_UNMAPPED, named];
+	failure->status = StelaStatusUnmapped;
+	stela_report(what.UTF8String, failure);
+}
+
+/* How long a call answered Pending waits before it calls again: 0.5 ms,
+ * doubling to 4 ms. The host compiles meanwhile on a processor whose guest
+ * waits, which this thread's sleep may be. */
+static void wait_pending(unsigned waits)
+{
+	usleep(waits < 3 ? 500u << waits : 4000u);
+}
+
+uint32_t stela_gate_call(StelaGate *gate, uint32_t operation, const void *request, size_t request_bytes,
+			 void *response, size_t response_bytes, StelaSpans spans, StelaFailure *failure)
+{
+	StelaFailure unread;
+	failure = failure ? failure : &unread;
+	volatile StelaGateCall call;
+	unsigned denials = 0;
+	unsigned unreads = 0;
+	unsigned tries = 0;
+	unsigned waits = 0;
+	bool again;
+	do {
+		if (++tries > MAX_UNMAPPED) {
+			report_unreachable(operation, spans, failure);
+			return failure->status;
+		}
+		touch(stela_span(response, response_bytes), true);
+		for (size_t i = 0; i < spans.read_count; i++) {
+			touch(spans.reads[i], false);
+		}
+		for (size_t i = 0; i < spans.write_count; i++) {
+			touch(spans.writes[i], true);
+		}
+		/* The record itself, which the service reads first. */
+		touch(stela_span((const void *)&call, sizeof(call)), true);
+		call = (StelaGateCall){
+			.operation = operation,
+			.status = StelaStatusClosed,
+			.request = stela_span(request, request_bytes),
+			.response = stela_span(response, response_bytes),
+			.reason = stela_span(failure->reason, sizeof(failure->reason) - 1),
+		};
+		/* The store runs the call: `call` holds its answer at the next instruction. */
+		gate->page[STELA_GATE_CALL / sizeof(uint64_t)] = (uint64_t)&call;
+		/* Still closed: the service never reached the record, and the gate says why. */
+		failure->fault = call.status == StelaStatusClosed ? gate->page[STELA_GATE_FAULT / sizeof(uint64_t)] : 0;
+		/* Not ready: nothing of the call took effect, and a wait is no try
+		 * at mapping its memory. */
+		if (call.status == StelaStatusPending) {
+			tries--;
+			wait_pending(waits++);
+		}
+		/* The pager can take back the stack's page after the record is written. */
+		again = call.status == StelaStatusUnmapped || call.status == StelaStatusPending ||
+			(failure->fault == STELA_GATE_FAULT_DENIED && ++denials < 16);
+		/* Still closed with no reason and no fault: the service never wrote
+		 * the record. The gate keeps one fault per connection, so another
+		 * thread's call can clear the fault of a record the service could
+		 * not read before this thread reads it. A record the service did not
+		 * read ran nothing: make the call again. */
+		if (!again && call.status == StelaStatusClosed && call.reason_length == 0 && failure->fault == 0 &&
+		    ++unreads < MAX_UNREAD) {
+			again = true;
+		}
+	} while (again);
+	failure->status = call.status;
+	size_t length = call.reason_length < sizeof(failure->reason) ? call.reason_length : sizeof(failure->reason) - 1;
+	failure->reason[call.status == StelaStatusOk ? 0 : length] = 0;
+	/* A call the service never read has no reason of its own: name the
+	 * operation and the gate's fault, and say so once. */
+	if (call.status == StelaStatusClosed && length == 0) {
+		snprintf(failure->reason, sizeof(failure->reason), "operation %u did not reach the device: gate fault %llu",
+			 operation, failure->fault);
+		if (operation != StelaOperationReport) {
+			stela_report("a gate call", failure);
+		}
+	}
+	return call.status;
+}
+
+NSError *stela_error(NSString *domain, NSInteger code, const StelaFailure *failure)
+{
+	NSString *key = NSLocalizedDescriptionKey;
+	NSString *reason = [NSString stringWithUTF8String:failure->reason];
+	NSDictionary *information = [NSDictionary dictionaryWithObjects:&reason forKeys:&key count:1];
+	return [NSError errorWithDomain:domain code:code userInfo:information];
+}
+
+static StelaGate *_Atomic reporting;
+
+void stela_report_to(StelaGate *gate)
+{
+	reporting = gate;
+}
+
+void stela_report(const char *what, const StelaFailure *failure)
+{
+	static os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
+	static NSMutableDictionary *reported;
+	NSString *message = [NSString stringWithFormat:@"%s: status %u, gate fault %llu: %s", what, failure->status,
+						       failure->fault, failure->reason];
+	os_unfair_lock_lock(&lock);
+	reported = reported ?: [NSMutableDictionary dictionary];
+	bool first = [reported objectForKey:message] == nil;
+	[reported setObject:message forKey:message];
+	os_unfair_lock_unlock(&lock);
+	if (first) {
+		NSLog(@"StelaGPU: %@", message);
+		StelaGate *gate = reporting;
+		if (gate) {
+			/* The host's log names the process each report came from. */
+			NSString *named = [NSString stringWithFormat:@"%s[%d] %@", getprogname(), getpid(), message];
+			StelaReportRequest request = {.text = stela_span(named.UTF8String, strlen(named.UTF8String))};
+			StelaEmpty empty;
+			/* The text is a span the call reads, so its pages are mapped first. */
+			StelaSpans spans = {.reads = &request.text, .read_count = 1};
+			STELA_CALL_SPANS(gate, Report, &request, &empty, spans, NULL);
+		}
+	}
+}
+
+static void *reserve(StelaStream *stream, size_t bytes)
+{
+	if (stream->capacity - stream->length < bytes) {
+		size_t capacity = stream->capacity ? stream->capacity : 4096;
+		/* A stream past half the address space is a corrupt size. Either
+		 * stop is named first, in the system log and the host's. */
+		if (bytes > SIZE_MAX / 4 - stream->length) {
+			StelaFailure failure = {.status = StelaStatusOutOfMemory, .reason = "the size is out of range"};
+			stela_report("a command stream entry", &failure);
+			abort();
+		}
+		while (capacity - stream->length < bytes) {
+			capacity *= 2;
+		}
+		uint8_t *grown = realloc(stream->bytes, capacity);
+		if (!grown) {
+			StelaFailure failure = {.status = StelaStatusOutOfMemory, .reason = "out of memory"};
+			stela_report("a command stream's growth", &failure);
+			abort();
+		}
+		stream->bytes = grown;
+		stream->capacity = capacity;
+	}
+	void *at = stream->bytes + stream->length;
+	stream->length += bytes;
+	return at;
+}
+
+void stela_stream_entry(StelaStream *stream, uint32_t code, const void *record, size_t record_bytes,
+			const void *data, size_t data_bytes)
+{
+	size_t length = record_bytes + data_bytes;
+	size_t padded = (length + 7) & ~(size_t)7;
+	uint8_t *entry = reserve(stream, sizeof(StelaCommandHeader) + padded);
+	*(StelaCommandHeader *)entry = (StelaCommandHeader){.code = code, .length = (uint32_t)length};
+	entry += sizeof(StelaCommandHeader);
+	if (record_bytes) {
+		memcpy(entry, record, record_bytes);
+	}
+	if (data_bytes) {
+		memcpy(entry + record_bytes, data, data_bytes);
+	}
+	memset(entry + length, 0, padded - length);
+}
+
+void stela_stream_append(StelaStream *stream, const StelaStream *other)
+{
+	if (other->length) {
+		memcpy(reserve(stream, other->length), other->bytes, other->length);
+	}
+}
+
+void stela_stream_free(StelaStream *stream)
+{
+	free(stream->bytes);
+	*stream = (StelaStream){0};
+}

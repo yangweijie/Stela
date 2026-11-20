@@ -1,0 +1,987 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+// Copyright 2004-2005 Red Hat, Inc.
+//! Command slots: issuing, launching and completing ATA commands and the queued
+//! block commands.
+
+use super::*;
+
+impl Disk {
+    /// The commands the port runs at once: a slot each while NCQ is on.
+    pub(super) fn queue_depth(&self) -> usize {
+        if self.ncq.enabled() {
+            1 + self.slots.len()
+        } else {
+            1
+        }
+    }
+
+    /// The lowest slot within the queue depth no started command holds.
+    pub(super) fn free_slot(&self) -> Option<usize> {
+        (0..self.queue_depth()).find(|slot| self.running.iter().all(|run| run.slot != *slot))
+    }
+
+    pub(super) fn table(&self, slot: usize) -> &DmaBuffer {
+        match slot {
+            0 => &self.table,
+            slot => &self.slots[slot - 1].table,
+        }
+    }
+
+    /// Page `index` of slot `slot`'s data memory: a page of slot 0's bounce
+    /// buffer, or of the pool pages another slot holds.
+    pub(super) fn slot_page(&mut self, slot: usize, index: usize) -> &mut [u8] {
+        match slot {
+            0 => &mut self.bounce.bytes_mut()[index * PAGE..][..PAGE],
+            slot => {
+                let page = self.slots[slot - 1].pages[index];
+                self.pool.pages[usize::from(page)].bytes_mut()
+            }
+        }
+    }
+
+    /// Copy `data` into the start of slot `slot`'s data memory.
+    pub(super) fn stage(&mut self, slot: usize, data: &[u8]) {
+        for (index, part) in data.chunks(PAGE).enumerate() {
+            self.slot_page(slot, index)[..part.len()].copy_from_slice(part);
+        }
+    }
+
+    /// Append the first `bytes` of slot `slot`'s data memory to `into`.
+    pub(super) fn gather(&mut self, slot: usize, bytes: usize, into: &mut Vec<u8>) {
+        for index in 0..bytes.div_ceil(PAGE) {
+            let part = (bytes - index * PAGE).min(PAGE);
+            into.extend_from_slice(&self.slot_page(slot, index)[..part]);
+        }
+    }
+
+    /// Give slot `slot`'s pool pages back, unless the disk failed or its
+    /// timing did, which may leave a command reaching them.
+    pub(super) fn release(&mut self, slot: usize) {
+        if slot == 0 || self.ready().is_err() {
+            return;
+        }
+        let mut pages = core::mem::take(&mut self.slots[slot - 1].pages);
+        self.pool.give_back(&mut pages);
+        self.slots[slot - 1].pages = pages;
+    }
+
+    /// The Physical Region Descriptor Table entries for `bytes` of slot
+    /// `slot`'s data memory, or at `buffer`: each region's address and byte
+    /// count, adjoining pages joined (AHCI 1.3.1 §4.2.3.3).
+    fn regions(&self, slot: usize, buffer: Option<u64>, bytes: usize) -> Vec<(u64, usize)> {
+        let start = match (slot, buffer) {
+            (_, Some(address)) => address,
+            (0, None) => self.bounce.bus_address(),
+            (slot, None) => {
+                let mut regions: Vec<(u64, usize)> = Vec::new();
+                let pages = &self.slots[slot - 1].pages;
+                for (index, &page) in pages.iter().take(bytes.div_ceil(PAGE)).enumerate() {
+                    let address = self.pool.pages[usize::from(page)].bus_address();
+                    let part = (bytes - index * PAGE).min(PAGE);
+                    match regions.last_mut() {
+                        Some((at, length)) if *at + *length as u64 == address => *length += part,
+                        _ => regions.push((address, part)),
+                    }
+                }
+                return regions;
+            }
+        };
+        alloc::vec![(start, bytes)]
+    }
+
+    /// Run one ATA command in slot 0 with `bytes` of data through its bounce
+    /// buffer.
+    pub(super) fn issue(
+        &mut self,
+        command: u8,
+        lba: u64,
+        count: u16,
+        bytes: usize,
+        write: bool,
+    ) -> Result<(), BlockError> {
+        let port = self.port;
+        self.issue_on(&port, command, lba, count, bytes, write)
+    }
+
+    /// One command through libata's error handling: recover the port after a
+    /// failure, then retry as `ata_eh_finish` decides, and complete a failed
+    /// command by its fetched or generated sense data as sd does.
+    pub(super) fn issue_on(
+        &mut self,
+        port: &impl CommandPort,
+        command: u8,
+        lba: u64,
+        count: u16,
+        bytes: usize,
+        write: bool,
+    ) -> Result<(), BlockError> {
+        self.issue_with(port, (command, 0), lba, count, bytes, write)
+    }
+
+    /// [`Self::issue_on`] with the command's FEATURE field.
+    pub(super) fn issue_with(
+        &mut self,
+        port: &impl CommandPort,
+        command: (u8, u16),
+        lba: u64,
+        count: u16,
+        bytes: usize,
+        write: bool,
+    ) -> Result<(), BlockError> {
+        let issue = self.prepare(command, lba, count, bytes, write)?;
+        self.complete(port, issue)
+    }
+
+    /// Run `issue` to its result in slot 0, after the started block
+    /// commands'.
+    pub(super) fn complete(
+        &mut self,
+        port: &impl CommandPort,
+        mut issue: Issue,
+    ) -> Result<(), BlockError> {
+        while self.running.iter().any(|running| running.result.is_none()) {
+            self.run(port);
+            crate::waiting();
+            core::hint::spin_loop();
+        }
+        loop {
+            if let Some(result) = self.step(port, &mut issue) {
+                return result;
+            }
+            crate::waiting();
+            core::hint::spin_loop();
+        }
+    }
+
+    pub(super) fn prepare(
+        &self,
+        (command, feature): (u8, u16),
+        lba: u64,
+        count: u16,
+        bytes: usize,
+        write: bool,
+    ) -> Result<Issue, BlockError> {
+        self.ready()?;
+        Ok(Issue {
+            slot: 0,
+            command,
+            feature,
+            lba,
+            count,
+            bytes,
+            write,
+            io: matches!(
+                command,
+                ATA_READ_DMA_EXT
+                    | ATA_WRITE_DMA_EXT
+                    | ATA_READ_FPDMA_QUEUED
+                    | ATA_WRITE_FPDMA_QUEUED
+            ),
+            prepared: self.clock.try_start().map_err(|_| BlockError::Timeout)?,
+            retries: 0,
+            launched: None,
+            resume: None,
+        })
+    }
+
+    /// Move `issue` on without waiting, the port running nothing else:
+    /// [`Self::advance`] for one command.
+    pub(super) fn step(
+        &mut self,
+        port: &impl CommandPort,
+        issue: &mut Issue,
+    ) -> Option<Result<(), BlockError>> {
+        self.advance(port, &mut [issue]).pop().flatten()
+    }
+
+    /// Move `issues`, each in its own slot, on without waiting: launch
+    /// those that may run, take one look at the port, and recover it from a
+    /// failure in place, after which each failed command is retried as
+    /// `ata_eh_finish` decides and completes by its fetched or generated
+    /// sense data, as sd does ([`Self::settle`]). Each issue's result once
+    /// it has one.
+    pub(super) fn advance(
+        &mut self,
+        port: &impl CommandPort,
+        issues: &mut [&mut Issue],
+    ) -> Vec<Option<Result<(), BlockError>>> {
+        let (mut results, failed) = self.launch_and_look(port, issues);
+        if let Some(Failed {
+            mut failure,
+            blamed,
+            io,
+        }) = failed
+        {
+            let recovered = block_on(self.recover(port, &mut failure, io));
+            let settled = self.settle(issues, blamed, &failure, recovered);
+            for (result, settled) in results.iter_mut().zip(settled) {
+                if settled.is_some() {
+                    *result = settled;
+                }
+            }
+        }
+        results
+    }
+
+    /// The part of [`Self::advance`] before error handling: launch the
+    /// issues that may run and take one look at the port. Each issue's
+    /// result once it has one, and the failure the look found, which the
+    /// launched commands wait on until the port is recovered.
+    ///
+    /// Linux `ata_std_qc_defer`: in turn, a queued command launches beside
+    /// queued ones, any other alone. A failure reaches every launched
+    /// command, as `ata_link_abort` does; one the NCQ Command Error log does
+    /// not blame runs again uncharged (`ata_eh_qc_retry` without an error).
+    pub(super) fn launch_and_look(
+        &mut self,
+        port: &impl CommandPort,
+        issues: &mut [&mut Issue],
+    ) -> (Vec<Option<Result<(), BlockError>>>, Option<Failed>) {
+        let mut results: Vec<_> = issues.iter().map(|_| None).collect();
+        if let Err(error) = self.minimum.ready() {
+            for result in &mut results {
+                *result = Some(Err(error.clone()));
+            }
+            return (results, None);
+        }
+        let mut launched = issues
+            .iter()
+            .filter(|issue| issue.launched.is_some())
+            .count();
+        let mut plain = issues.iter().any(|issue| {
+            issue
+                .launched
+                .as_ref()
+                .is_some_and(|launched| !launched.queued)
+        });
+        for (index, issue) in issues.iter_mut().enumerate() {
+            if issue.launched.is_some() || issue.resume.is_some_and(|resume| !resume.passed()) {
+                continue;
+            }
+            issue.resume = None;
+            if let Err(error) = self.ready() {
+                results[index] = Some(Err(error));
+                continue;
+            }
+            let command = self.rw_command(issue.command);
+            let queued = matches!(command, ATA_READ_FPDMA_QUEUED | ATA_WRITE_FPDMA_QUEUED);
+            if plain || (!queued && launched > 0) {
+                break;
+            }
+            match self.launch(
+                port,
+                issue.slot,
+                launched == 0,
+                AtaRequest {
+                    command,
+                    feature: issue.feature,
+                    lba: issue.lba,
+                    count: issue.count,
+                    bytes: issue.bytes,
+                    write: issue.write,
+                    buffer: None,
+                },
+                self.command_timeout_us,
+            ) {
+                Ok(started) => {
+                    issue.launched = Some(started);
+                    launched += 1;
+                    plain |= !queued;
+                }
+                Err(failure) => results[index] = Some(Err(failure.error)),
+            }
+        }
+        let seen = {
+            let launched: Vec<&Launched> = issues
+                .iter()
+                .filter_map(|issue| issue.launched.as_ref())
+                .collect();
+            if launched.is_empty() {
+                return (results, None);
+            }
+            match self.look(port, &launched) {
+                Some(seen) => seen,
+                None => return (results, None),
+            }
+        };
+        for (index, issue) in issues.iter_mut().enumerate() {
+            if issue
+                .launched
+                .as_ref()
+                .is_some_and(|launched| seen.done >> launched.slot & 1 != 0)
+            {
+                issue.launched = None;
+                // ata_verify_xfer: a completed DMA transfer verifies it.
+                if issue.io {
+                    self.dubious = false;
+                }
+                results[index] = Some(Ok(()));
+            }
+        }
+        let Some(failure) = seen.failure else {
+            return (results, None);
+        };
+        let io = issues
+            .iter()
+            .any(|issue| issue.launched.is_some() && issue.io);
+        let failed = Failed {
+            failure,
+            blamed: seen.blamed,
+            io,
+        };
+        (results, Some(failed))
+    }
+
+    /// What error handling's end, `recovered`, means for the launched
+    /// `issues` a failure reached: once the port is recovered each command
+    /// it charged, the one the NCQ Command Error log names in `failure` or
+    /// those in `blamed`, is disposed of ([`Self::dispose`]) and the others
+    /// run again uncharged; a disk it could not recover is disabled and
+    /// every launched command fails with its error. Each issue's result
+    /// once it has one.
+    pub(super) fn settle(
+        &mut self,
+        issues: &mut [&mut Issue],
+        blamed: u32,
+        failure: &Failure,
+        recovered: Result<(), BlockError>,
+    ) -> Vec<Option<Result<(), BlockError>>> {
+        let mut results: Vec<_> = issues.iter().map(|_| None).collect();
+        if let Err(error) = recovered {
+            self.fault = Some(error.clone());
+            for (index, issue) in issues.iter_mut().enumerate() {
+                if issue.launched.take().is_some() {
+                    results[index] = Some(Err(error.clone()));
+                }
+            }
+            return results;
+        }
+        for (index, issue) in issues.iter_mut().enumerate() {
+            let Some(launched) = issue.launched.take() else {
+                continue;
+            };
+            let charged = match failure.named {
+                Some(slot) => slot == launched.slot,
+                None => blamed >> launched.slot & 1 != 0,
+            };
+            if charged {
+                results[index] = self.dispose(issue, failure.clone());
+            }
+        }
+        results
+    }
+
+    /// `ata_build_rw_tf`: reads and writes are queued while NCQ is enabled.
+    pub(super) fn rw_command(&self, command: u8) -> u8 {
+        match command {
+            ATA_READ_DMA_EXT if self.ncq.enabled() => ATA_READ_FPDMA_QUEUED,
+            ATA_WRITE_DMA_EXT if self.ncq.enabled() => ATA_WRITE_FPDMA_QUEUED,
+            _ => command,
+        }
+    }
+
+    /// An internal command (`ata_exec_internal`): a failure kicks the engine
+    /// so it forgets the command, and is returned as is, also when the
+    /// engine does not stop, as `ahci_post_internal_cmd` ignores that.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Return complete typed command failure and recovery context without allocation on the failure path."
+    )]
+    pub(super) async fn internal(
+        &mut self,
+        port: &impl CommandPort,
+        command: u8,
+        feature: u8,
+        count: u16,
+        bytes: usize,
+        buffer: u64,
+    ) -> Result<(), Failure> {
+        self.ready().map_err(Failure::new)?;
+        let Err(failure) = self
+            .attempt(
+                port,
+                AtaRequest {
+                    command,
+                    feature: u16::from(feature),
+                    lba: 0,
+                    count,
+                    bytes,
+                    write: false,
+                    buffer: Some(buffer),
+                },
+            )
+            .await
+        else {
+            return Ok(());
+        };
+        self.minimum.ready().map_err(Failure::new)?;
+        if stop_engine(port, self.clock).await.is_ok() {
+            start_engine(port);
+        }
+        Err(failure)
+    }
+
+    /// Linux `ata_internal_cmd_timeout`: an internal command's timeout in
+    /// this error handling run, never longer than a block command's.
+    pub(super) fn internal_timeout_us(&self, command: u8) -> u64 {
+        let timeout = match internal_class(command) {
+            Some(class) => INTERNAL_TIMEOUTS_US[class].1[usize::from(self.timeout_steps[class])],
+            None => INTERNAL_DEFAULT_TIMEOUT_US,
+        };
+        timeout.min(self.command_timeout_us)
+    }
+
+    /// Linux `ata_internal_cmd_timed_out`: the class's next command waits
+    /// for the next timeout, the last one staying.
+    pub(super) fn internal_timed_out(&mut self, command: u8) {
+        if let Some(class) = internal_class(command) {
+            let step = &mut self.timeout_steps[class];
+            if usize::from(*step) + 1 < INTERNAL_TIMEOUTS_US[class].1.len() {
+                *step += 1;
+            }
+        }
+    }
+
+    /// Issue the internal command once in slot 0, the port running nothing
+    /// else, and wait for its completion or error, at most its
+    /// [`Self::internal_timeout_us`]: each look that finds neither ends the
+    /// step.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Return complete typed command failure and recovery context without allocation on the failure path."
+    )]
+    pub(super) async fn attempt(
+        &mut self,
+        port: &impl CommandPort,
+        request: AtaRequest,
+    ) -> Result<(), Failure> {
+        let command = request.command;
+        let timeout_us = self.internal_timeout_us(command);
+        let launched = self.launch(port, 0, true, request, timeout_us)?;
+        loop {
+            self.minimum.ready().map_err(Failure::new)?;
+            if let Some(seen) = self.look(port, &[&launched]) {
+                let Some(failure) = seen.failure else {
+                    return Ok(());
+                };
+                if failure.mask & ERR_TIMEOUT != 0 {
+                    self.internal_timed_out(command);
+                }
+                return Err(failure);
+            }
+            yield_now().await;
+        }
+    }
+
+    /// Issue the command once in `slot`, to complete within `timeout_us`;
+    /// `alone` when the port runs no other command, whose interrupts and
+    /// ending FIS marks it may clear.
+    #[expect(
+        clippy::result_large_err,
+        reason = "Return complete typed command failure and recovery context without allocation on the failure path."
+    )]
+    pub(super) fn launch(
+        &mut self,
+        port: &impl CommandPort,
+        slot: usize,
+        alone: bool,
+        request: AtaRequest,
+        timeout_us: u64,
+    ) -> Result<Launched, Failure> {
+        self.ready().map_err(Failure::new)?;
+        let AtaRequest {
+            command,
+            feature,
+            lba,
+            count,
+            bytes,
+            write,
+            buffer,
+        } = request;
+        let table = self.table(slot).bus_address();
+        // A queued command's sector count moves to the features registers;
+        // the count register carries its tag, its slot, in bits 7:3.
+        let queued = matches!(command, ATA_READ_FPDMA_QUEUED | ATA_WRITE_FPDMA_QUEUED);
+        let (feature, count) = if queued {
+            (count, (slot as u16) << 3)
+        } else {
+            (feature, count)
+        };
+        let fis = [
+            FIS_REGISTER_HOST_TO_DEVICE,
+            FIS_COMMAND,
+            command,
+            feature as u8,
+            lba as u8,
+            (lba >> 8) as u8,
+            (lba >> 16) as u8,
+            if command == ATA_IDENTIFY {
+                0
+            } else {
+                DEVICE_LBA
+            },
+            (lba >> 24) as u8,
+            (lba >> 32) as u8,
+            (lba >> 40) as u8,
+            (feature >> 8) as u8,
+            count as u8,
+            (count >> 8) as u8,
+        ];
+        let regions = if bytes > 0 {
+            self.regions(slot, buffer, bytes)
+        } else {
+            Vec::new()
+        };
+        let entries = regions.len() as u32;
+        let tables: &mut DmaBuffer = match slot {
+            0 => &mut self.table,
+            slot => &mut self.slots[slot - 1].table,
+        };
+        tables.bytes_mut()[..TABLE_HEADER_BYTES].fill(0);
+        tables.bytes_mut()[..fis.len()].copy_from_slice(&fis);
+        for (index, (address, length)) in regions.into_iter().enumerate() {
+            let entry = index * PRDT_ENTRY_BYTES;
+            tables.write(PRDT_ADDRESS + entry, address);
+            tables.write(PRDT_ADDRESS + entry + 8, 0u32);
+            tables.write(PRDT_BYTE_COUNT + entry, length as u32 - 1);
+        }
+        let flags = COMMAND_FIS_DWORDS
+            | u32::from(write) << COMMAND_WRITE_SHIFT
+            | entries << COMMAND_PRDT_SHIFT;
+        let header = slot * COMMAND_HEADER_BYTES;
+        self.commands.write(header, flags);
+        self.commands.write(header + 4, 0u32);
+        self.commands.write(header + 8, table);
+        fence(Ordering::SeqCst);
+        // The FIS a command ends with lands in the received-FIS area in RAM.
+        // Mark its types with the H2D Register type, as a hardreset does, to
+        // see one arrive; a look marks a queued command's again.
+        if alone {
+            port.write32(PORT_INTERRUPTS, u32::MAX);
+            for &(at, _) in ending(queued) {
+                self.commands.write(at, FIS_REGISTER_HOST_TO_DEVICE);
+            }
+            // The first look reads the registers too: an emulated port may
+            // finish at the PxCI write.
+            self.looks = 0;
+        }
+        fence(Ordering::SeqCst);
+        let deadline = self
+            .clock
+            .try_deadline(timeout_us)
+            .map_err(|_| Failure::new(BlockError::Timeout))?;
+        // ahci_qc_issue: a queued command is active in PxSACT until the
+        // disk's Set Device Bits FIS clears it.
+        if queued {
+            port.write32(PORT_SATA_ACTIVE, 1 << slot);
+        }
+        port.write32(PORT_ISSUE, 1 << slot);
+        Ok(Launched {
+            slot,
+            queued,
+            command,
+            deadline,
+        })
+    }
+
+    /// One look at `launched`, all queued commands or one other; never
+    /// waits. PxIS and PxSACT or PxCI, which a hypervisor traps, are read
+    /// when an ending FIS arrived, every few looks since a failure may post
+    /// none, and at a deadline. A queued command's Set Device Bits FIS is
+    /// marked again before PxSACT is read, so a later one is seen. Nothing
+    /// when no command completed or failed.
+    pub(super) fn look(&mut self, port: &impl CommandPort, launched: &[&Launched]) -> Option<Seen> {
+        let queued = launched.iter().any(|launched| launched.queued);
+        let due = self.looks.is_multiple_of(REGISTER_POLL_INTERVAL);
+        self.looks = self.looks.wrapping_add(1);
+        let posted = ending(queued)
+            .iter()
+            .any(|&(at, kind)| self.commands.read::<u8>(at) == kind);
+        // The deadlines are read only when nothing else calls for a look.
+        if !posted && !due && !launched.iter().any(|launched| launched.deadline.passed()) {
+            return None;
+        }
+        let seen = self.look_at(port, launched, queued, posted);
+        // Linux ahci_handle_port_intr: IS last, after PxIS, so the next
+        // completion sends the next message.
+        self.clear_signal();
+        seen
+    }
+
+    /// The register part of [`Self::look`].
+    fn look_at(
+        &mut self,
+        port: &impl CommandPort,
+        launched: &[&Launched],
+        queued: bool,
+        posted: bool,
+    ) -> Option<Seen> {
+        let active = if queued { PORT_SATA_ACTIVE } else { PORT_ISSUE };
+        if queued && posted {
+            self.commands
+                .write(RECEIVED_SDB, FIS_REGISTER_HOST_TO_DEVICE);
+            fence(Ordering::SeqCst);
+        }
+        let status = port.read32(PORT_INTERRUPTS);
+        // Linux ahci_port_intr: the completion bits read are cleared before
+        // PxSACT or PxCI is read, so a completion after that read sets them
+        // again. Error bits stay for the failure below, which clears them.
+        if self.signal.is_some() && status & INTERRUPT_COMPLETION != 0 {
+            port.write32(PORT_INTERRUPTS, status & INTERRUPT_COMPLETION);
+        }
+        let mut interrupts = status & INTERRUPT_ERROR;
+        // ahci_handle_port_interrupt: a PhyRdy change LPM explains is
+        // dropped and its SError bit cleared, which clears PRCS.
+        if interrupts & INTERRUPT_PHY_READY_CHANGE != 0 && self.ignore_phy_events() {
+            interrupts &= !INTERRUPT_PHY_READY_CHANGE;
+            port.write32(PORT_SATA_ERROR, SERROR_PHY_READY_CHANGE);
+        }
+        let running = port.read32(active);
+        fence(Ordering::SeqCst);
+        let slots = launched
+            .iter()
+            .fold(0, |slots, launched| slots | 1 << launched.slot);
+        let done = slots & !running;
+        let expired = launched
+            .iter()
+            .filter(|launched| running >> launched.slot & 1 != 0 && launched.deadline.passed())
+            .fold(0, |slots, launched| slots | 1 << launched.slot);
+        if interrupts == 0 && expired == 0 {
+            return (done != 0).then_some(Seen {
+                done,
+                failure: None,
+                blamed: 0,
+            });
+        }
+        // AHCI needs SError cleared; otherwise it might lock up.
+        let serror = port.read32(PORT_SATA_ERROR);
+        port.write32(PORT_SATA_ERROR, serror);
+        port.write32(PORT_INTERRUPTS, port.read32(PORT_INTERRUPTS));
+        let timed_out = interrupts == 0;
+        let lpm = self.lpm.policy > LPM_MAX_POWER;
+        let task_file = port.read32(PORT_TASK_FILE);
+        let mut failure = classify(interrupts, serror, task_file, timed_out, lpm);
+        // The first expired command, named with what the port showed.
+        if let Some(launched) = launched
+            .iter()
+            .find(|launched| expired >> launched.slot & 1 != 0)
+        {
+            failure.error = BlockError::Expired(Box::new(Expired {
+                step: command_wait(launched.command),
+                waited_us: self
+                    .clock
+                    .try_elapsed_us(launched.deadline.started())
+                    .unwrap_or(0),
+                registers: alloc::vec![
+                    ("PxCI", port.read32(PORT_ISSUE)),
+                    ("PxSACT", port.read32(PORT_SATA_ACTIVE)),
+                    ("PxTFD", task_file),
+                    ("PxSSTS", port.read32(PORT_SATA_STATUS)),
+                    ("PxIS", status),
+                    ("PxSERR", serror),
+                    ("PxCMD", port.read32(PORT_COMMAND)),
+                ],
+            }));
+        }
+        // ahci_qc_fill_rtf, before error handling issues anything else: the
+        // Set Device Bits FIS for a queued command, else the last D2H FIS.
+        let fis = if queued { RECEIVED_SDB } else { RECEIVED_D2H };
+        let fis = &self.commands.bytes()[fis..fis + FIS_BYTES];
+        failure.result = [fis[2], fis[3]];
+        failure.queued = queued;
+        failure.slots = if queued { slots } else { 0 };
+        // An error interrupt reaches every launched command, as
+        // ata_link_abort does: those that completed run again. A timeout
+        // charges the expired commands, after those that completed.
+        Some(if timed_out {
+            Seen {
+                done,
+                failure: Some(failure),
+                blamed: expired,
+            }
+        } else {
+            Seen {
+                done: 0,
+                failure: Some(failure),
+                blamed: slots,
+            }
+        })
+    }
+
+    /// Take `command` as a started block command, in the lowest free slot.
+    pub(super) fn begin(&mut self, command: Command) -> Result<u32, BlockError> {
+        self.ready()?;
+        let command = command.within(&self.identity, 0)?;
+        let Some(slot) = self.free_slot() else {
+            return Err(BlockError::Protocol(
+                "every AHCI command slot is running a command",
+            ));
+        };
+        if slot != 0 {
+            let bytes = match &command {
+                Command::Read { bytes, .. } => *bytes,
+                Command::Write { data, .. } => data.len(),
+                Command::Discard { .. } => ATA_SECTOR_BYTES as usize,
+                Command::Flush | Command::WriteZeroes { .. } => 0,
+            };
+            let pages = bytes.min(self.chunk_bytes()).div_ceil(PAGE);
+            self.release(slot);
+            self.slots[slot - 1].pages = self
+                .pool
+                .take(pages)
+                .ok_or(BlockError::Protocol("every AHCI bounce page is in use"))?;
+        }
+        let tag = self.next_tag;
+        self.next_tag = tag.wrapping_add(1);
+        self.running.push(Running {
+            tag,
+            slot,
+            command,
+            done: 0,
+            data: Vec::new(),
+            issue: None,
+            result: None,
+        });
+        Ok(tag)
+    }
+
+    /// Move the started block commands on as far as they go, recovering
+    /// the port in place from each failure, the caller waiting: error
+    /// handling run to its end, as for a caller that waits anyway.
+    /// [`AhciDisk`] runs it a step at a time instead.
+    pub(super) fn run(&mut self, port: &impl CommandPort) {
+        while let Some(Failed {
+            mut failure,
+            blamed,
+            io,
+        }) = self.run_stepped(port)
+        {
+            let recovered = block_on(self.recover(port, &mut failure, io));
+            self.settle_running(blamed, &failure, recovered);
+        }
+    }
+
+    /// Move the started block commands on as far as they go without
+    /// waiting, up to a failure: the launched commands it reached wait for
+    /// error handling, whose end [`Self::settle_running`] takes.
+    pub(super) fn run_stepped(&mut self, port: &impl CommandPort) -> Option<Failed> {
+        let mut running = core::mem::take(&mut self.running);
+        let mut failed = None;
+        loop {
+            for command in running
+                .iter_mut()
+                .filter(|command| command.result.is_none() && command.issue.is_none())
+            {
+                match self.next_issue(command) {
+                    Ok(Some(issue)) => command.issue = Some(issue),
+                    Ok(None) => {
+                        let data = core::mem::take(&mut command.data);
+                        let read = matches!(command.command, Command::Read { .. });
+                        command.result = Some(Ok(read.then_some(data)));
+                    }
+                    Err(error) => command.result = Some(Err(error)),
+                }
+            }
+            let mut issues: Vec<&mut Issue> = running
+                .iter_mut()
+                .filter_map(|command| command.issue.as_mut())
+                .collect();
+            if issues.is_empty() {
+                break;
+            }
+            let (results, failure) = self.launch_and_look(port, &mut issues);
+            let progressed = self.take_results(&mut running, results);
+            if failure.is_some() {
+                failed = failure;
+                break;
+            }
+            if !progressed {
+                break;
+            }
+        }
+        self.running = running;
+        failed
+    }
+
+    /// The end of the error handling a [`Self::run_stepped`] failure
+    /// started, for the started commands it reached ([`Self::settle`]).
+    pub(super) fn settle_running(
+        &mut self,
+        blamed: u32,
+        failure: &Failure,
+        recovered: Result<(), BlockError>,
+    ) {
+        let mut running = core::mem::take(&mut self.running);
+        let results = {
+            let mut issues: Vec<&mut Issue> = running
+                .iter_mut()
+                .filter_map(|command| command.issue.as_mut())
+                .collect();
+            self.settle(&mut issues, blamed, failure, recovered)
+        };
+        self.take_results(&mut running, results);
+        self.running = running;
+    }
+
+    /// Give the started commands with an issue their issues' `results`, in
+    /// order: a failed part fails its command, a completed one adds its
+    /// data. Whether any had one.
+    fn take_results(
+        &mut self,
+        running: &mut [Running],
+        results: Vec<Option<Result<(), BlockError>>>,
+    ) -> bool {
+        let mut progressed = false;
+        for (command, result) in running
+            .iter_mut()
+            .filter(|command| command.issue.is_some())
+            .zip(results)
+        {
+            let Some(result) = result else {
+                continue;
+            };
+            progressed = true;
+            let Some(issue) = command.issue.take() else {
+                continue;
+            };
+            match result {
+                Err(error) => command.result = Some(Err(error)),
+                Ok(()) => {
+                    if let Command::Read { .. } = command.command {
+                        self.gather(command.slot, issue.bytes, &mut command.data);
+                    }
+                    command.done += issue.bytes.max(1);
+                }
+            }
+        }
+        progressed
+    }
+
+    /// The next part of `running`'s command, its data staged in its slot's
+    /// memory, or `None` once all of it is done.
+    pub(super) fn next_issue(&mut self, running: &Running) -> Result<Option<Issue>, BlockError> {
+        let block = self.identity.block_size as usize;
+        let done = running.done;
+        let slot = running.slot;
+        let issue = match &running.command {
+            Command::Read { lba, bytes } if done < *bytes => {
+                let part = (bytes - done).min(self.chunk_bytes());
+                let first = lba + (done / block) as u64;
+                let count = self.sectors(part);
+                self.prepare((ATA_READ_DMA_EXT, 0), first, count, part, false)?
+            }
+            Command::Write {
+                lba,
+                data,
+                fua: false,
+            } if done < data.len() => {
+                let part = (data.len() - done).min(self.chunk_bytes());
+                self.stage(slot, &data[done..done + part]);
+                let first = lba + (done / block) as u64;
+                let count = self.sectors(part);
+                self.prepare((ATA_WRITE_DMA_EXT, 0), first, count, part, true)?
+            }
+            Command::Flush if done == 0 => match self.flush {
+                Some(command) => self.prepare((command, 0), 0, 0, 0, false)?,
+                None => return Ok(None),
+            },
+            Command::Discard { extents } if done == 0 => {
+                let &[Extent { lba, blocks }] = extents.as_slice() else {
+                    return Err(BlockError::Unsupported("one TRIM range a command"));
+                };
+                self.trim(lba, blocks, slot)?
+            }
+            Command::Write { fua: true, .. } => {
+                return Err(BlockError::Unsupported(
+                    "the device takes no Force Unit Access",
+                ));
+            }
+            Command::WriteZeroes { .. } => {
+                return Err(BlockError::Unsupported("the device takes no Write Zeroes"));
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some(Issue { slot, ..issue }))
+    }
+
+    /// TRIM in one block of ranges, as libata's `ata_format_dsm_trim_descr`
+    /// writes them: each the starting logical sector in bits 47:0 and the
+    /// count in bits 63:48, staged in `slot`'s memory.
+    pub(super) fn trim(&mut self, lba: u64, blocks: u64, slot: usize) -> Result<Issue, BlockError> {
+        let bytes = usize::try_from(blocks)
+            .ok()
+            .and_then(|blocks| blocks.checked_mul(self.identity.block_size as usize))
+            .ok_or(BlockError::Unsupported("a TRIM past one block of ranges"))?;
+        self.identity.check_write(lba, bytes)?;
+        let (mut sector, mut sectors) = (lba, blocks);
+        if sectors > TRIM_RANGES * TRIM_RANGE_SECTORS {
+            return Err(BlockError::Unsupported("a TRIM past one block of ranges"));
+        }
+        self.ready()?;
+        let ranges = &mut self.slot_page(slot, 0)[..ATA_SECTOR_BYTES as usize];
+        ranges.fill(0);
+        for range in ranges.chunks_mut(8) {
+            if sectors == 0 {
+                break;
+            }
+            let count = sectors.min(TRIM_RANGE_SECTORS);
+            range.copy_from_slice(&(sector | count << 48).to_le_bytes());
+            (sector, sectors) = (sector + count, sectors - count);
+        }
+        self.prepare(
+            (ATA_DATA_SET_MANAGEMENT, TRIM),
+            0,
+            1,
+            ATA_SECTOR_BYTES as usize,
+            true,
+        )
+    }
+}
+
+/// The [`INTERNAL_TIMEOUTS_US`] class of an internal command.
+fn internal_class(command: u8) -> Option<usize> {
+    INTERNAL_TIMEOUTS_US
+        .iter()
+        .position(|(commands, _)| commands.contains(&command))
+}
+
+/// What a command's expired wait is reported as: the command, and the
+/// slot's bit it waited to see cleared.
+fn command_wait(command: u8) -> &'static str {
+    macro_rules! wait {
+        ($name:literal, $code:literal) => {
+            concat!(
+                "ATA ",
+                $name,
+                " (",
+                $code,
+                "), waiting for its PxCI bit to clear"
+            )
+        };
+        ($name:literal, $code:literal, queued) => {
+            concat!(
+                "ATA ",
+                $name,
+                " (",
+                $code,
+                "), waiting for its PxSACT bit to clear"
+            )
+        };
+    }
+    match command {
+        ATA_IDENTIFY => wait!("IDENTIFY DEVICE", "0xec"),
+        ATA_SET_FEATURES => wait!("SET FEATURES", "0xef"),
+        ATA_READ_LOG_EXT => wait!("READ LOG EXT", "0x2f"),
+        ATA_READ_LOG_DMA_EXT => wait!("READ LOG DMA EXT", "0x47"),
+        ATA_REQUEST_SENSE_DATA_EXT => wait!("REQUEST SENSE DATA EXT", "0x0b"),
+        ATA_STANDBY_IMMEDIATE => wait!("STANDBY IMMEDIATE", "0xe0"),
+        ATA_READ_DMA_EXT => wait!("READ DMA EXT", "0x25"),
+        ATA_WRITE_DMA_EXT => wait!("WRITE DMA EXT", "0x35"),
+        ATA_READ_FPDMA_QUEUED => wait!("READ FPDMA QUEUED", "0x60", queued),
+        ATA_WRITE_FPDMA_QUEUED => wait!("WRITE FPDMA QUEUED", "0x61", queued),
+        ATA_FLUSH_CACHE => wait!("FLUSH CACHE", "0xe7"),
+        ATA_FLUSH_CACHE_EXT => wait!("FLUSH CACHE EXT", "0xea"),
+        ATA_DATA_SET_MANAGEMENT => wait!("DATA SET MANAGEMENT", "0x06"),
+        _ => "ATA command, waiting for its PxCI bit to clear",
+    }
+}

@@ -1,0 +1,1216 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+/* AIR and LLVM math, conversions, half arithmetic, derivatives and discard.
+ * Original LLVM IR fixtures in the call forms air_math.c documents; no Apple
+ * output. Exact results are checked by folding each call's NIR. */
+#include "../metal_abi.h"
+#include "compiler/air_to_nir.h"
+#include "air_test_fixture.h"
+#include "util/half_float.h"
+#include "util/ralloc.h"
+#include <assert.h>
+#include <stdlib.h>
+#include <math.h>
+#include <stdio.h>
+#include <string.h>
+#ifdef STELA_AIR_TEST_NAK
+#include "air_test_nak.h"
+#endif
+#ifdef NDEBUG
+#error "These tests require active assertions"
+#endif
+
+static const nir_shader_compiler_options nir_options = {.max_unroll_iterations = 32};
+
+static const char *module =
+   "target datalayout = \"e-p:64:64-i32:32-i64:64-f32:32-v128:128-n8:16:32\"\n"
+   "target triple = \"air64_v29-apple-macosx27.2.0\"\n";
+
+static const char *versions =
+   "!air.version = !{!20}\n!air.language_version = !{!21}\n!llvm.ident = !{!22}\n"
+   "!air.compile_options = !{!23, !24, !25}\n"
+   "!20 = !{i32 2, i32 9, i32 0}\n!21 = !{!\"Metal\", i32 4, i32 1, i32 0}\n"
+   "!22 = !{!\"Apple metal version 32023.922 (metalfe-32023.922.4)\"}\n"
+   "!23 = !{!\"air.compile.denorms_disable\"}\n!24 = !{!\"air.compile.fast_math_enable\"}\n"
+   "!25 = !{!\"air.compile.framebuffer_fetch_enable\"}\n";
+
+static const char *kernel_metadata =
+   "!air.kernel = !{!2}\n!2 = !{ptr @kernel, !3, !4}\n!3 = !{}\n!4 = !{!40}\n"
+   "!40 = !{i32 0, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.read_write\","
+   " !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\","
+   " i32 4, !\"air.arg_type_name\", !\"uint\", !\"air.arg_name\", !\"out\"}\n";
+
+static struct stela_metal_stage primary = {.table = STELA_METAL_TABLE_PRIMARY};
+
+static nir_shader *
+translate_rounded(const char *declarations, const char *body, const nir_shader_compiler_options *options,
+                  stela_air_bind_buffer bind, bool round_toward_zero, struct stela_air_error *error)
+{
+   char definition[2048], all[2048];
+   snprintf(definition, sizeof(definition), "define void @kernel(ptr addrspace(1) %%out) {\n%s}\n", body);
+   snprintf(all, sizeof(all), "%s%s", kernel_metadata, versions);
+   LLVMMemoryBufferRef input = stela_air_test_custom_bitcode(module, declarations, definition, all);
+   const struct stela_air_options o = {
+      .workgroup_size = {1, 1, 1}, .max_instructions = 10000,
+      .bind_buffer = bind, .binding_data = &primary,
+      .fp_profile = STELA_AIR_FP_METAL, .max_private_bytes = 64,
+      .round_toward_zero = round_toward_zero,
+   };
+   nir_shader *shader = stela_air_to_nir(LLVMGetBufferStart(input), LLVMGetBufferSize(input),
+                                         "kernel", options, &o, error);
+   LLVMDisposeMemoryBuffer(input);
+   return shader;
+}
+
+static nir_shader *
+translate(const char *declarations, const char *body, const nir_shader_compiler_options *options,
+          stela_air_bind_buffer bind, struct stela_air_error *error)
+{
+   return translate_rounded(declarations, body, options, bind, false, error);
+}
+
+static nir_shader *
+kernel(const char *declarations, const char *type, const char *expression,
+       struct stela_air_error *error)
+{
+   char body[1024];
+   snprintf(body, sizeof(body), "%%r = %s\nstore %s %%r, ptr addrspace(1) %%out, align 2\nret void\n",
+            expression, type);
+   return translate(declarations, body, &nir_options, stela_metal_bind_buffer, error);
+}
+
+#ifdef STELA_AIR_TEST_NAK
+/* NAK takes lowered push constants, so its compiles bind a fixed address. */
+static nir_def *
+fixed_buffer(nir_builder *b, const struct stela_air_buffer *buffer, void *data)
+{
+   return nir_imm_int64(b, 0x100000); /* Compile fixture only. */
+}
+
+struct fixture {
+   const char *declarations, *body;
+};
+
+static nir_shader *
+nak_translate(const nir_shader_compiler_options *options, void *data)
+{
+   const struct fixture *fixture = data;
+   struct stela_air_error error;
+   return translate(fixture->declarations, fixture->body, options, fixed_buffer, &error);
+}
+#endif
+
+/* The bits of the value the last `intrinsic` stores in `shader`, its
+ * operations folded; frees the shader. */
+static uint64_t
+stored(nir_shader *shader, nir_intrinsic_op intrinsic)
+{
+   while (nir_opt_constant_folding(shader))
+      ;
+   nir_intrinsic_instr *store = NULL;
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic == intrinsic)
+               store = nir_instr_as_intrinsic(instr);
+         }
+      }
+   }
+   /* Global and scratch stores take their value first. */
+   if (!store || !nir_src_is_const(store->src[0]))
+      nir_print_shader(shader, stderr);
+   assert(store && nir_src_is_const(store->src[0]));
+   uint64_t bits = nir_src_as_uint(store->src[0]);
+   ralloc_free(shader);
+   return bits;
+}
+
+/* The kernel `body` stores through %out, which must translate. */
+static nir_shader *
+translated(const char *declarations, const char *body)
+{
+   struct stela_air_error error = {0};
+   nir_shader *shader = translate(declarations, body, &nir_options, stela_metal_bind_buffer, &error);
+   if (!shader)
+      fprintf(stderr, "%s: %u %s\n", body, error.kind, error.detail);
+   assert(shader);
+   return shader;
+}
+
+/* The bits of %r, of `type`, once `setup` defines it. */
+static uint64_t
+fold_body(const char *declarations, const char *setup, const char *type)
+{
+   char body[1024];
+   snprintf(body, sizeof(body), "%sstore %s %%r, ptr addrspace(1) %%out, align 2\nret void\n",
+            setup, type);
+   return stored(translated(declarations, body), nir_intrinsic_store_global);
+}
+
+/* The bits the kernel stores for `expression`, a call of `declaration`. */
+static uint64_t
+fold(const char *declaration, const char *type, const char *expression)
+{
+   char setup[512];
+   snprintf(setup, sizeof(setup), "%%r = %s\n", expression);
+   return fold_body(declaration, setup, type);
+}
+
+/* The bits of lane `lane` of the `vector` a call of `declaration` returns. */
+static uint64_t
+fold_lane(const char *declaration, const char *vector, const char *type, const char *call,
+          unsigned lane)
+{
+   char setup[512];
+   snprintf(setup, sizeof(setup), "%%v = %s\n%%r = extractelement %s %%v, i32 %u\n", call, vector,
+            lane);
+   return fold_body(declaration, setup, type);
+}
+
+/* The bits a call of `declaration` stores through its thread pointer %p, an
+ * alloca of `pointee`, and those of its `type` result in `result`. */
+static uint64_t
+fold_second(const char *declaration, const char *pointee, const char *type, const char *call,
+            uint64_t *result)
+{
+   char body[1024];
+   snprintf(body, sizeof(body),
+            "%%p = alloca %s, align 16\n%%r = %s\nstore %s %%r, ptr addrspace(1) %%out, align 2\n"
+            "ret void\n", pointee, call, type);
+   nir_shader *shader = translated(declaration, body);
+   *result = stored(nir_shader_clone(NULL, shader), nir_intrinsic_store_global);
+   return stored(shader, nir_intrinsic_store_scratch);
+}
+
+static uint32_t
+f32(float value)
+{
+   uint32_t bits;
+   memcpy(&bits, &value, sizeof(bits));
+   return bits;
+}
+
+#define CHECK_FOLD(declaration, type, expression, expected)                                        \
+   do {                                                                                            \
+      uint64_t folded = fold(declaration, type, expression);                                       \
+      if (folded != (uint64_t)(expected))                                                          \
+         fprintf(stderr, "%s: %#llx, expected %#llx\n", expression, (unsigned long long)folded,     \
+                 (unsigned long long)(expected));                                                  \
+      assert(folded == (uint64_t)(expected));                                                      \
+   } while (0)
+
+static void
+floating_functions_follow_metal(void)
+{
+   CHECK_FOLD("declare float @air.round.f32(float)\n", "float", "call float @air.round.f32(float 2.5)",
+              f32(3.0f));
+   CHECK_FOLD("declare float @llvm.round.f32(float)\n", "float",
+              "call float @llvm.round.f32(float -0.5)", f32(-1.0f));
+   CHECK_FOLD("declare float @air.fract.f32(float)\n", "float", "call float @air.fract.f32(float -0.25)",
+              f32(0.75f));
+   CHECK_FOLD("declare float @air.fast_fmod.f32(float, float)\n", "float",
+              "call float @air.fast_fmod.f32(float -7.0, float 3.0)", f32(-1.0f));
+   CHECK_FOLD("", "float", "frem fast float -7.0, 3.0", f32(-1.0f));
+   CHECK_FOLD("declare float @air.copysign.f32(float, float)\n", "float",
+              "call float @air.copysign.f32(float 2.0, float -0.0)", f32(-2.0f));
+   CHECK_FOLD("declare float @air.fmedian3.f32(float, float, float)\n", "float",
+              "call float @air.fmedian3.f32(float 3.0, float 1.0, float 2.0)", f32(2.0f));
+   CHECK_FOLD("declare float @air.fast_clamp.f32(float, float, float)\n", "float",
+              "call float @air.fast_clamp.f32(float 5.0, float 0.0, float 1.0)", f32(1.0f));
+   CHECK_FOLD("declare float @air.mix.f32(float, float, float)\n", "float",
+              "call float @air.mix.f32(float 0.0, float 10.0, float 0.25)", f32(2.5f));
+   CHECK_FOLD("declare float @air.dot.v3f32(<3 x float>, <3 x float>)\n", "float",
+              "call float @air.dot.v3f32(<3 x float> <float 1.0, float 2.0, float 3.0>,"
+              " <3 x float> <float 4.0, float 5.0, float 6.0>)",
+              f32(32.0f));
+   CHECK_FOLD("declare float @air.fast_length.v2f32(<2 x float>)\n", "float",
+              "call float @air.fast_length.v2f32(<2 x float> <float 3.0, float 4.0>)", f32(5.0f));
+   CHECK_FOLD("declare float @llvm.fma.f32(float, float, float)\n", "float",
+              "call float @llvm.fma.f32(float 2.0, float 3.0, float 1.0)", f32(7.0f));
+   CHECK_FOLD("", "float", "fdiv fast float 1.0, 4.0", f32(0.25f));
+   CHECK_FOLD("declare float @llvm.sqrt.f32(float)\n", "float",
+              "call afn float @llvm.sqrt.f32(float 16.0)", f32(4.0f));
+   /* Half precision, with transcendental functions evaluated in float. */
+   CHECK_FOLD("", "half", "fadd half 0xH3C00, 0xH3C00", 0x4000);
+   CHECK_FOLD("", "half", "fneg half 0xH3C00", 0xbc00);
+   CHECK_FOLD("declare half @air.sqrt.f16(half)\n", "half", "call half @air.sqrt.f16(half 0xH4400)",
+              0x4000);
+   /* sign keeps zeros' signs and makes NaN 0. */
+   CHECK_FOLD("declare float @air.sign.f32(float)\n", "float", "call float @air.sign.f32(float -3.0)",
+              f32(-1.0f));
+   CHECK_FOLD("declare float @air.sign.f32(float)\n", "float", "call float @air.sign.f32(float -0.0)",
+              0x80000000u);
+   CHECK_FOLD("declare float @air.sign.f32(float)\n", "float",
+              "call float @air.sign.f32(float 0x7FF8000000000000)", 0);
+   CHECK_FOLD("declare half @air.sign.f16(half)\n", "half", "call half @air.sign.f16(half 0xH4500)",
+              0x3c00);
+   /* nextafter steps one representable value, from zero to a subnormal. */
+   CHECK_FOLD("declare float @air.nextafter.f32(float, float)\n", "float",
+              "call float @air.nextafter.f32(float 1.0, float 2.0)", 0x3f800001u);
+   CHECK_FOLD("declare float @air.nextafter.f32(float, float)\n", "float",
+              "call float @air.nextafter.f32(float 1.0, float 0.0)", 0x3f7fffffu);
+   CHECK_FOLD("declare float @air.nextafter.f32(float, float)\n", "float",
+              "call float @air.nextafter.f32(float -1.0, float 0.0)", 0xbf7fffffu);
+   CHECK_FOLD("declare float @air.nextafter.f32(float, float)\n", "float",
+              "call float @air.nextafter.f32(float -0.0, float 1.0)", 1);
+   CHECK_FOLD("declare float @air.nextafter.f32(float, float)\n", "float",
+              "call float @air.nextafter.f32(float 2.0, float 2.0)", f32(2.0f));
+   CHECK_FOLD("declare float @air.ldexp.f32(float, i32)\n", "float",
+              "call float @air.ldexp.f32(float 1.5, i32 3)", f32(12.0f));
+   CHECK_FOLD("declare float @air.fast_ldexp.f32(float, i32)\n", "float",
+              "call float @air.fast_ldexp.f32(float 1.0, i32 -2)", f32(0.25f));
+   CHECK_FOLD("declare half @air.ldexp.f16(half, i32)\n", "half",
+              "call half @air.ldexp.f16(half 0xH3C00, i32 -1)", 0x3800);
+   /* ilogb is Apple's library's, with Darwin's results for zero and
+    * infinity. */
+   CHECK_FOLD("declare i32 @___metal_ilogb_float(float, i32)\n", "i32",
+              "call i32 @___metal_ilogb_float(float 10.0, i32 0)", 3);
+   CHECK_FOLD("declare i32 @___metal_ilogb_float(float, i32)\n", "i32",
+              "call i32 @___metal_ilogb_float(float 0.0, i32 1)", 0x80000000u);
+   CHECK_FOLD("declare i32 @___metal_ilogb_float(float, i32)\n", "i32",
+              "call i32 @___metal_ilogb_float(float 0x7FF0000000000000, i32 0)", 0x7fffffffu);
+   CHECK_FOLD("declare i32 @___metal_ilogb_half(half, i32)\n", "i32",
+              "call i32 @___metal_ilogb_half(half 0xH0001, i32 0)", (uint32_t)-24);
+   CHECK_FOLD("declare i32 @air.ilogb.f32(float)\n", "i32", "call i32 @air.ilogb.f32(float 10.0)", 3);
+   CHECK_FOLD("declare i32 @air.ilogb.f16(half)\n", "i32", "call i32 @air.ilogb.f16(half 0xH0000)",
+              0x80000000u);
+}
+
+static void
+integer_functions_follow_metal(void)
+{
+   CHECK_FOLD("declare i32 @air.clz.i32(i32, i1)\n", "i32", "call i32 @air.clz.i32(i32 1, i1 false)", 31);
+   CHECK_FOLD("declare i16 @air.clz.i16(i16, i1)\n", "i16", "call i16 @air.clz.i16(i16 1, i1 false)", 15);
+   CHECK_FOLD("declare i32 @air.ctz.i32(i32, i1)\n", "i32", "call i32 @air.ctz.i32(i32 0, i1 false)", 32);
+   CHECK_FOLD("declare i64 @air.ctz.i64(i64, i1)\n", "i64",
+              "call i64 @air.ctz.i64(i64 4294967296, i1 false)", 32);
+   CHECK_FOLD("declare i32 @air.popcount.i32(i32)\n", "i32", "call i32 @air.popcount.i32(i32 255)", 8);
+   CHECK_FOLD("declare i32 @air.reverse_bits.i32(i32)\n", "i32",
+              "call i32 @air.reverse_bits.i32(i32 1)", 0x80000000u);
+   CHECK_FOLD("declare i16 @air.reverse_bits.i16(i16)\n", "i16",
+              "call i16 @air.reverse_bits.i16(i16 1)", 0x8000);
+   CHECK_FOLD("declare i32 @air.max.s.i32(i32, i32)\n", "i32",
+              "call i32 @air.max.s.i32(i32 -1, i32 1)", 1);
+   CHECK_FOLD("declare i32 @air.max.u.i32(i32, i32)\n", "i32",
+              "call i32 @air.max.u.i32(i32 -1, i32 1)", 0xffffffffu);
+   CHECK_FOLD("declare i32 @air.mul_hi.u.i32(i32, i32)\n", "i32",
+              "call i32 @air.mul_hi.u.i32(i32 -1, i32 2)", 1);
+   CHECK_FOLD("declare i8 @air.add_sat.u.i8(i8, i8)\n", "i8",
+              "call i8 @air.add_sat.u.i8(i8 -6, i8 10)", 0xff);
+   CHECK_FOLD("declare i32 @llvm.abs.i32(i32, i1)\n", "i32",
+              "call i32 @llvm.abs.i32(i32 -5, i1 false)", 5);
+   CHECK_FOLD("declare i32 @air.abs_diff.s.i32(i32, i32)\n", "i32",
+              "call i32 @air.abs_diff.s.i32(i32 -5, i32 3)", 8);
+   CHECK_FOLD("declare i8 @air.abs_diff.s.i8(i8, i8)\n", "i8",
+              "call i8 @air.abs_diff.s.i8(i8 -128, i8 127)", 0xff);
+   CHECK_FOLD("declare i8 @air.abs_diff.u.i8(i8, i8)\n", "i8",
+              "call i8 @air.abs_diff.u.i8(i8 5, i8 -6)", 245);
+   /* Halved sums round down, or up for rhadd, without overflowing. */
+   CHECK_FOLD("declare i32 @air.hadd.s.i32(i32, i32)\n", "i32",
+              "call i32 @air.hadd.s.i32(i32 -3, i32 0)", 0xfffffffeu);
+   CHECK_FOLD("declare i8 @air.hadd.u.i8(i8, i8)\n", "i8", "call i8 @air.hadd.u.i8(i8 -1, i8 -1)", 0xff);
+   CHECK_FOLD("declare i8 @air.rhadd.u.i8(i8, i8)\n", "i8", "call i8 @air.rhadd.u.i8(i8 -2, i8 -1)", 0xff);
+   CHECK_FOLD("declare i32 @air.rhadd.s.i32(i32, i32)\n", "i32",
+              "call i32 @air.rhadd.s.i32(i32 -3, i32 0)", 0xffffffffu);
+   CHECK_FOLD("declare i32 @air.mad_hi.u.i32(i32, i32, i32)\n", "i32",
+              "call i32 @air.mad_hi.u.i32(i32 -1, i32 2, i32 1)", 2);
+   /* mad_sat saturates the exact x * y + z. */
+   CHECK_FOLD("declare i32 @air.mad_sat.s.i32(i32, i32, i32)\n", "i32",
+              "call i32 @air.mad_sat.s.i32(i32 65536, i32 65536, i32 0)", 0x7fffffffu);
+   CHECK_FOLD("declare i32 @air.mad_sat.s.i32(i32, i32, i32)\n", "i32",
+              "call i32 @air.mad_sat.s.i32(i32 -65536, i32 65536, i32 0)", 0x80000000u);
+   CHECK_FOLD("declare i32 @air.mad_sat.s.i32(i32, i32, i32)\n", "i32",
+              "call i32 @air.mad_sat.s.i32(i32 3, i32 4, i32 -20)", (uint32_t)-8);
+   CHECK_FOLD("declare i8 @air.mad_sat.u.i8(i8, i8, i8)\n", "i8",
+              "call i8 @air.mad_sat.u.i8(i8 15, i8 16, i8 15)", 0xff);
+   CHECK_FOLD("declare i8 @air.mad_sat.u.i8(i8, i8, i8)\n", "i8",
+              "call i8 @air.mad_sat.u.i8(i8 15, i8 16, i8 14)", 0xfe);
+   CHECK_FOLD("declare i64 @air.mad_sat.s.i64(i64, i64, i64)\n", "i64",
+              "call i64 @air.mad_sat.s.i64(i64 9223372036854775807, i64 1, i64 1)", INT64_MAX);
+   CHECK_FOLD("declare i64 @air.mad_sat.s.i64(i64, i64, i64)\n", "i64",
+              "call i64 @air.mad_sat.s.i64(i64 -1, i64 1, i64 -9223372036854775808)", INT64_MIN);
+   CHECK_FOLD("declare i64 @air.mad_sat.u.i64(i64, i64, i64)\n", "i64",
+              "call i64 @air.mad_sat.u.i64(i64 -1, i64 1, i64 1)", UINT64_MAX);
+   CHECK_FOLD("declare i32 @air.max3.s.i32(i32, i32, i32)\n", "i32",
+              "call i32 @air.max3.s.i32(i32 1, i32 -5, i32 3)", 3);
+   CHECK_FOLD("declare i32 @air.min3.u.i32(i32, i32, i32)\n", "i32",
+              "call i32 @air.min3.u.i32(i32 1, i32 -5, i32 3)", 1);
+   CHECK_FOLD("declare i32 @air.median3.s.i32(i32, i32, i32)\n", "i32",
+              "call i32 @air.median3.s.i32(i32 1, i32 -5, i32 3)", 1);
+   CHECK_FOLD("declare i32 @air.mul24.s.i32(i32, i32)\n", "i32",
+              "call i32 @air.mul24.s.i32(i32 -3, i32 4)", (uint32_t)-12);
+   CHECK_FOLD("declare i32 @air.mad24.u.i32(i32, i32, i32)\n", "i32",
+              "call i32 @air.mad24.u.i32(i32 3, i32 4, i32 5)", 17);
+   /* Rotations take their count modulo the width. */
+   CHECK_FOLD("declare i32 @air.rotate.i32(i32, i32)\n", "i32",
+              "call i32 @air.rotate.i32(i32 -2147483647, i32 1)", 3);
+   CHECK_FOLD("declare i8 @air.rotate.i8(i8, i8)\n", "i8", "call i8 @air.rotate.i8(i8 -127, i8 9)", 3);
+   CHECK_FOLD("declare i32 @air.rotate.i32(i32, i32)\n", "i32",
+              "call i32 @air.rotate.i32(i32 5, i32 32)", 5);
+   /* Bit fields: signed extraction extends the field's sign; an empty
+    * field reads 0 and writes nothing. */
+   CHECK_FOLD("declare i32 @air.extract_bits.u.i32(i32, i32, i32)\n", "i32",
+              "call i32 @air.extract_bits.u.i32(i32 43981, i32 4, i32 8)", 0xbc);
+   CHECK_FOLD("declare i32 @air.extract_bits.s.i32(i32, i32, i32)\n", "i32",
+              "call i32 @air.extract_bits.s.i32(i32 240, i32 4, i32 4)", 0xffffffffu);
+   CHECK_FOLD("declare i32 @air.extract_bits.s.i32(i32, i32, i32)\n", "i32",
+              "call i32 @air.extract_bits.s.i32(i32 240, i32 4, i32 0)", 0);
+   CHECK_FOLD("declare i16 @air.extract_bits.u.i16(i16, i32, i32)\n", "i16",
+              "call i16 @air.extract_bits.u.i16(i16 -32768, i32 15, i32 1)", 1);
+   CHECK_FOLD("declare i32 @air.insert_bits.u.i32(i32, i32, i32, i32)\n", "i32",
+              "call i32 @air.insert_bits.u.i32(i32 65535, i32 0, i32 4, i32 8)", 0xf00f);
+   CHECK_FOLD("declare i32 @air.insert_bits.u.i32(i32, i32, i32, i32)\n", "i32",
+              "call i32 @air.insert_bits.u.i32(i32 4660, i32 255, i32 4, i32 0)", 4660);
+   CHECK_FOLD("declare i32 @air.insert_bits.s.i32(i32, i32, i32, i32)\n", "i32",
+              "call i32 @air.insert_bits.s.i32(i32 1, i32 -559038737, i32 0, i32 32)", 0xdeadbeefu);
+}
+
+/* sincos and frexp store their second result through a thread pointer. */
+static void
+second_results_store_through_thread_pointers(void)
+{
+   uint64_t result;
+   assert(fold_second("declare float @air.fast_sincos.f32(float, ptr)\n", "float", "float",
+                      "call float @air.fast_sincos.f32(float 0.0, ptr %p)", &result) == f32(1.0f));
+   assert(result == 0);
+   assert(fold_second("declare half @air.sincos.f16(half, ptr)\n", "half", "half",
+                      "call half @air.sincos.f16(half 0xH0000, ptr %p)", &result) == 0x3c00);
+   assert(result == 0);
+   assert(fold_second("declare float @___metal_frexp_float_pthreadint32(float, ptr)\n", "i32",
+                      "float", "call float @___metal_frexp_float_pthreadint32(float 12.0, ptr %p)",
+                      &result) == 4);
+   assert(result == f32(0.75f));
+   /* Subnormals normalize. */
+   assert(fold_second("declare half @___metal_frexp_half_pthreadint32(half, ptr)\n", "i32", "half",
+                      "call half @___metal_frexp_half_pthreadint32(half 0xH0001, ptr %p)",
+                      &result) == (uint32_t)-23);
+   assert(result == 0x3800);
+   assert(fold_second("declare float @___metal_frexp_float_pthreadint32(float, ptr)\n", "i32",
+                      "float", "call float @___metal_frexp_float_pthreadint32(float 0.0, ptr %p)",
+                      &result) == 0);
+   assert(result == 0);
+   /* Metal 4.1's spellings. */
+   assert(fold_second("declare float @air.frexp.f32(float, ptr)\n", "i32", "float",
+                      "call float @air.frexp.f32(float 12.0, ptr %p)", &result) == 4);
+   assert(result == f32(0.75f));
+   assert(fold_second("declare half @air.frexp.f16(half, ptr)\n", "i32", "half",
+                      "call half @air.frexp.f16(half 0xH0001, ptr %p)", &result) == (uint32_t)-23);
+   assert(result == 0x3800);
+}
+
+/* Formats pack their first component lowest, rounding to even; NaN packs as
+ * zero and sRGB converts color but not alpha. */
+static void
+packing_follows_metal(void)
+{
+   CHECK_FOLD("declare i32 @air.pack.unorm4x8.v4f32(<4 x float>)\n", "i32",
+              "call i32 @air.pack.unorm4x8.v4f32(<4 x float> <float 1.0, float 0.0, float 0.5,"
+              " float 0x7FF8000000000000>)", 0x008000ffu);
+   CHECK_FOLD("declare i32 @air.pack.snorm4x8.v4f32(<4 x float>)\n", "i32",
+              "call i32 @air.pack.snorm4x8.v4f32(<4 x float> <float -1.0, float 2.0, float 0.0,"
+              " float -0.5>)", 0xc0007f81u);
+   CHECK_FOLD("declare i32 @air.pack.unorm2x16.v2f16(<2 x half>)\n", "i32",
+              "call i32 @air.pack.unorm2x16.v2f16(<2 x half> <half 0xH3C00, half 0xH0000>)", 0xffff);
+   CHECK_FOLD("declare i16 @air.pack.unorm.rgb565.v3f32(<3 x float>)\n", "i16",
+              "call i16 @air.pack.unorm.rgb565.v3f32(<3 x float> <float 1.0, float 0.0, float 1.0>)",
+              0xf81f);
+   CHECK_FOLD("declare i32 @air.pack.unorm.rgb10a2.v4f32(<4 x float>)\n", "i32",
+              "call i32 @air.pack.unorm.rgb10a2.v4f32(<4 x float> <float 1.0, float 0.0, float 0.0,"
+              " float 1.0>)", 0xc00003ffu);
+   CHECK_FOLD("declare i32 @air.pack.unorm4x8.srgb.v4f32(<4 x float>)\n", "i32",
+              "call i32 @air.pack.unorm4x8.srgb.v4f32(<4 x float> <float 0.0, float 0.0, float 0.0,"
+              " float 0.5>)", 0x80000000u);
+   const char *unorm = "declare <4 x float> @air.unpack.unorm4x8.v4f32(i32)\n";
+   assert(fold_lane(unorm, "<4 x float>", "float",
+                    "call <4 x float> @air.unpack.unorm4x8.v4f32(i32 -2130771968)", 2) == f32(1.0f));
+   assert(fold_lane(unorm, "<4 x float>", "float",
+                    "call <4 x float> @air.unpack.unorm4x8.v4f32(i32 -2130771968)", 3) ==
+          f32(128.0f / 255.0f));
+   const char *snorm = "declare <4 x float> @air.unpack.snorm4x8.v4f32(i32)\n";
+   assert(fold_lane(snorm, "<4 x float>", "float",
+                    "call <4 x float> @air.unpack.snorm4x8.v4f32(i32 128)", 0) == f32(-1.0f));
+   assert(fold_lane(snorm, "<4 x float>", "float",
+                    "call <4 x float> @air.unpack.snorm4x8.v4f32(i32 127)", 0) == f32(1.0f));
+   assert(fold_lane("declare <3 x float> @air.unpack.unorm.rgb565.v3f32(i16)\n", "<3 x float>",
+                    "float", "call <3 x float> @air.unpack.unorm.rgb565.v3f32(i16 31)", 0) ==
+          f32(1.0f));
+   assert(fold_lane("declare <4 x float> @air.unpack.unorm4x8.srgb.v4f32(i32)\n", "<4 x float>",
+                    "float", "call <4 x float> @air.unpack.unorm4x8.srgb.v4f32(i32 -16777216)", 3) ==
+          f32(1.0f));
+   assert(fold_lane("declare <2 x half> @air.unpack.unorm2x16.v2f16(i32)\n", "<2 x half>", "half",
+                    "call <2 x half> @air.unpack.unorm2x16.v2f16(i32 65535)", 0) == 0x3c00);
+   /* A 2-bit signed alpha holds -1, 0 and 1. */
+   CHECK_FOLD("declare i32 @air.pack.snorm.rgb10a2.v4f32(<4 x float>)\n", "i32",
+              "call i32 @air.pack.snorm.rgb10a2.v4f32(<4 x float> <float -1.0, float 1.0, float 0.0,"
+              " float -1.0>)", 0xc007fe01u);
+   const char *snorm10 = "declare <4 x float> @air.unpack.snorm.rgb10a2.v4f32(i32)\n";
+   assert(fold_lane(snorm10, "<4 x float>", "float",
+                    "call <4 x float> @air.unpack.snorm.rgb10a2.v4f32(i32 -1073741312)", 0) ==
+          f32(-1.0f));
+   assert(fold_lane(snorm10, "<4 x float>", "float",
+                    "call <4 x float> @air.unpack.snorm.rgb10a2.v4f32(i32 -1073741312)", 3) ==
+          f32(-1.0f));
+}
+
+/* Unsigned 11- and 10-bit floats round to nearest even, denormals included;
+ * negative values and -inf are zero, finite values above the largest are
+ * the largest, +inf is infinity and NaN a NaN. */
+static void
+small_floats_pack_as_vulkan_converts(void)
+{
+   const char *pack = "declare i32 @air.pack.unorm.rg11b10f.v3f32(<3 x float>)\n";
+   CHECK_FOLD(pack, "i32",
+              "call i32 @air.pack.unorm.rg11b10f.v3f32(<3 x float> <float 1.0,"
+              " float 0x7FF8000000000000, float -2.0>)", 0x3e0bc0u);
+   CHECK_FOLD(pack, "i32",
+              "call i32 @air.pack.unorm.rg11b10f.v3f32(<3 x float> <float 0x3FF0200000000000,"
+              " float 0x3FF0600000000000, float 1.0e9>)", 0xf7de13c0u);
+   CHECK_FOLD(pack, "i32",
+              "call i32 @air.pack.unorm.rg11b10f.v3f32(<3 x float> <float 0x3EB0000000000000,"
+              " float 0x3EA0000000000000, float 0x3EB8000000000000>)", 0x400001u);
+   CHECK_FOLD(pack, "i32",
+              "call i32 @air.pack.unorm.rg11b10f.v3f32(<3 x float> <float 0x7FF0000000000000,"
+              " float 0xFFF0000000000000, float 65024.0>)", 0xf7c007c0u);
+   assert(fold_lane("declare <3 x float> @air.unpack.unorm.rg11b10f.v3f32(i32)\n", "<3 x float>",
+                    "float", "call <3 x float> @air.unpack.unorm.rg11b10f.v3f32(i32 -138412032)",
+                    2) == f32(64512.0f));
+   /* Nine-bit mantissas over the exponent the largest component needs. */
+   CHECK_FOLD("declare i32 @air.pack.unorm.rgb9e5.v3f32(<3 x float>)\n", "i32",
+              "call i32 @air.pack.unorm.rgb9e5.v3f32(<3 x float> <float 1.0, float 0.5, float 0.0>)",
+              0x80010100u);
+   assert(fold_lane("declare <3 x float> @air.unpack.unorm.rgb9e5.v3f32(i32)\n", "<3 x float>",
+                    "float", "call <3 x float> @air.unpack.unorm.rgb9e5.v3f32(i32 -2147417856)", 1) ==
+          f32(0.5f));
+}
+
+static void
+bools_reduce(void)
+{
+   const char *declarations = "declare i1 @air.all.v4i1(<4 x i1>)\ndeclare i1 @air.any.v4i1(<4 x i1>)\n";
+   assert(fold_body(declarations,
+                    "%v = call i1 @air.all.v4i1(<4 x i1> <i1 true, i1 true, i1 false, i1 true>)\n"
+                    "%r = zext i1 %v to i32\n", "i32") == 0);
+   assert(fold_body(declarations,
+                    "%v = call i1 @air.any.v4i1(<4 x i1> <i1 false, i1 false, i1 true, i1 false>)\n"
+                    "%r = zext i1 %v to i32\n", "i32") == 1);
+}
+
+static void
+conversions_follow_their_names(void)
+{
+   CHECK_FOLD("declare i32 @air.convert.s.i32.f.f32(float)\n", "i32",
+              "call i32 @air.convert.s.i32.f.f32(float -2.75)", 0xfffffffeu);
+   CHECK_FOLD("declare half @air.convert.f.f16.f.f32(float)\n", "half",
+              "call half @air.convert.f.f16.f.f32(float 1.5)", 0x3e00);
+   CHECK_FOLD("declare float @air.convert.f.f32.u.i16(i16)\n", "float",
+              "call float @air.convert.f.f32.u.i16(i16 -1)", f32(65535.0f));
+   /* A bool converts as zero or one; anything nonzero is true. */
+   CHECK_FOLD("declare float @air.convert.f.f32.u.i1(i1)\n", "float",
+              "call float @air.convert.f.f32.u.i1(i1 true)", f32(1.0f));
+   CHECK_FOLD("declare i32 @air.convert.s.i32.u.i1(i1)\n", "i32",
+              "call i32 @air.convert.s.i32.u.i1(i1 true)", 1);
+   CHECK_FOLD("declare i32 @air.convert.s.i32.s.i16(i16)\n", "i32",
+              "call i32 @air.convert.s.i32.s.i16(i16 -2)", 0xfffffffeu);
+   CHECK_FOLD("declare i32 @air.convert.u.i32.u.i16(i16)\n", "i32",
+              "call i32 @air.convert.u.i32.u.i16(i16 -2)", 65534);
+   CHECK_FOLD("", "half", "fptrunc float 2.0 to half", 0x4000);
+   CHECK_FOLD("", "float", "fpext half 0xH3C00 to float", f32(1.0f));
+   CHECK_FOLD("", "i16", "fptosi float -3.5 to i16", 0xfffd);
+   CHECK_FOLD("", "float", "uitofp i8 -56 to float", f32(200.0f));
+   CHECK_FOLD("", "float", "sitofp i1 true to float", f32(-1.0f));
+   CHECK_FOLD("", "i32", "bitcast <2 x half> <half 0xH3C00, half 0xH4000> to i32", 0x40003c00u);
+}
+
+/* Fast inverse trigonometry meets Metal's 5 ulp bound, fast tanpi's poles
+ * keep their sign, and a fast half quotient rounds once. */
+static void
+fast_functions_meet_their_bounds(void)
+{
+   uint64_t asin = fold("declare float @air.fast_asin.f32(float)\n", "float",
+                        "call float @air.fast_asin.f32(float 0.5)");
+   int64_t asin_error = (int64_t)asin - (int64_t)f32(0.52359877559829887f);
+   assert(asin_error >= -5 && asin_error <= 5);
+   uint64_t atan = fold("declare float @air.fast_atan.f32(float)\n", "float",
+                        "call float @air.fast_atan.f32(float 1.0)");
+   int64_t atan_error = (int64_t)atan - (int64_t)f32(0.78539816339744831f);
+   assert(atan_error >= -5 && atan_error <= 5);
+   CHECK_FOLD("declare float @air.fast_tanpi.f32(float)\n", "float",
+              "call float @air.fast_tanpi.f32(float 0.5)", f32(INFINITY));
+   CHECK_FOLD("declare float @air.fast_tanpi.f32(float)\n", "float",
+              "call float @air.fast_tanpi.f32(float -0.5)", f32(-INFINITY));
+   /* 11.96875 / 2.5625 rounds once from single precision. */
+   CHECK_FOLD("", "half", "fdiv fast half 0xH49FC, 0xH4120", 0x44ac);
+}
+
+static void
+bfloats_round_to_nearest_even(void)
+{
+   CHECK_FOLD("", "bfloat", "fptrunc float 1.0 to bfloat", 0x3f80);
+   /* Halfway cases round to the even neighbor: 1 + 2^-8 down, 1 + 3 2^-8 up. */
+   CHECK_FOLD("", "bfloat", "fptrunc float 0x3FF0100000000000 to bfloat", 0x3f80);
+   CHECK_FOLD("", "bfloat", "fptrunc float 0x3FF0300000000000 to bfloat", 0x3f82);
+   /* A signaling NaN becomes quiet rather than rounding to infinity. */
+   CHECK_FOLD("", "bfloat", "fptrunc float 0x7FF0000020000000 to bfloat", 0x7fc0);
+   CHECK_FOLD("", "float", "fpext bfloat 0xR4049 to float", f32(3.140625f));
+   CHECK_FOLD("", "i32", "fptosi bfloat 0xRC040 to i32", 0xfffffffdu);
+   CHECK_FOLD("declare bfloat @air.convert.f.bf16.f.f32(float)\n", "bfloat",
+              "call bfloat @air.convert.f.bf16.f.f32(float 3.0)", 0x4040);
+   CHECK_FOLD("declare half @air.convert.f.f16.f.bf16(bfloat)\n", "half",
+              "call half @air.convert.f.f16.f.bf16(bfloat 0xR3FC0)", 0x3e00);
+   assert(fold_lane("declare <2 x bfloat> @air.convert.f.v2bf16.f.v2f32(<2 x float>)\n",
+                    "<2 x bfloat>", "bfloat",
+                    "call <2 x bfloat> @air.convert.f.v2bf16.f.v2f32(<2 x float> <float 1.0, float -2.0>)",
+                    1) == 0xc000);
+}
+
+static void
+refuses_misnamed_and_misplaced_functions(void)
+{
+   const struct {
+      const char *declaration, *type, *expression;
+      enum stela_air_error_kind kind;
+   } cases[] = {
+      /* Derivatives need a fragment function. */
+      {"declare float @air.dfdx.f32(float)\n", "float", "call float @air.dfdx.f32(float 1.0)",
+       STELA_AIR_INSTRUCTION},
+      /* A conversion's name spells its types. */
+      {"declare i16 @air.convert.s.i32.f.f32(float)\n", "i16",
+       "call i16 @air.convert.s.i32.f.f32(float 1.0)", STELA_AIR_INSTRUCTION},
+      {"declare float @air.convert.s.f32.f.f32(float)\n", "float",
+       "call float @air.convert.s.f32.f.f32(float 1.0)", STELA_AIR_INSTRUCTION},
+      /* An integer would round twice on its way to a bfloat. */
+      {"declare bfloat @air.convert.f.bf16.s.i32(i32)\n", "bfloat",
+       "call bfloat @air.convert.f.bf16.s.i32(i32 3)", STELA_AIR_TYPE},
+      {"", "bfloat", "sitofp i32 3 to bfloat", STELA_AIR_TYPE},
+      /* A bfloat's arithmetic is not a half's. */
+      {"", "bfloat", "fadd bfloat 0xR3F80, 0xR3F80", STELA_AIR_TYPE},
+      /* A function's name spells its overload. */
+      {"declare float @air.sqrt.f16(float)\n", "float", "call float @air.sqrt.f16(float 1.0)",
+       STELA_AIR_INSTRUCTION},
+      {"declare float @air.fast_frobnicate.f32(float)\n", "float",
+       "call float @air.fast_frobnicate.f32(float 1.0)", STELA_AIR_INSTRUCTION},
+      /* ldexp takes an exponent per lane. */
+      {"declare <2 x float> @air.ldexp.v2f32(<2 x float>, i32)\n", "<2 x float>",
+       "call <2 x float> @air.ldexp.v2f32(<2 x float> zeroinitializer, i32 1)", STELA_AIR_TYPE},
+      /* Packing types match their format. */
+      {"declare i32 @air.pack.unorm2x16.v4f32(<4 x float>)\n", "i32",
+       "call i32 @air.pack.unorm2x16.v4f32(<4 x float> zeroinitializer)", STELA_AIR_TYPE},
+      {"declare float @air.dot.v2f32(<2 x float>, <2 x float>)\n", "float",
+       "call float @air.dot.v2f32(<2 x float> zeroinitializer, <2 x float> <float 1.0, float 2.0>)",
+       STELA_AIR_OK},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(cases); i++) {
+      struct stela_air_error error = {0};
+      nir_shader *shader = kernel(cases[i].declaration, cases[i].type, cases[i].expression, &error);
+      if ((shader != NULL) != (cases[i].kind == STELA_AIR_OK) || error.kind != cases[i].kind)
+         fprintf(stderr, "case %u: %u %s\n", i, error.kind, error.detail);
+      assert((shader != NULL) == (cases[i].kind == STELA_AIR_OK) && error.kind == cases[i].kind);
+      ralloc_free(shader);
+   }
+}
+
+/* Only shaders with half arithmetic declare half float controls. */
+static void
+half_declares_its_float_controls(void)
+{
+   const unsigned single = FLOAT_CONTROLS_DENORM_FLUSH_TO_ZERO_FP32 | FLOAT_CONTROLS_ROUNDING_MODE_RTE_FP32;
+   const unsigned half = FLOAT_CONTROLS_DENORM_PRESERVE_FP16 | FLOAT_CONTROLS_ROUNDING_MODE_RTE_FP16;
+   const struct {
+      const char *type, *expression;
+      unsigned controls;
+   } cases[] = {
+      {"float", "fadd float 1.0, 2.0", single},
+      {"half", "fadd half 0xH3C00, 0xH3C00", single | half},
+      {"float", "fpext half 0xH3C00 to float", single | half},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(cases); i++) {
+      struct stela_air_error error = {0};
+      nir_shader *shader = kernel("", cases[i].type, cases[i].expression, &error);
+      assert(shader && shader->info.float_controls_execution_mode == cases[i].controls);
+      ralloc_free(shader);
+   }
+}
+
+static unsigned
+count_alu(nir_shader *shader, nir_op op)
+{
+   unsigned count = 0;
+   nir_foreach_block(block, nir_shader_get_entrypoint(shader)) {
+      nir_foreach_instr(instr, block) {
+         count += instr->type == nir_instr_type_alu && nir_instr_as_alu(instr)->op == op;
+      }
+   }
+   return count;
+}
+
+/* x as an LLVM float literal: its double's bits. */
+static const char *
+literal(float x, char *text, size_t size)
+{
+   double wide = x;
+   uint64_t bits;
+   memcpy(&bits, &wide, sizeof(bits));
+   snprintf(text, size, "0x%016" PRIX64, bits);
+   return text;
+}
+
+/* Fast inverse trigonometry evaluates in single precision: consumer GPUs
+ * run doubles at a small fraction of its rate. Each meets Metal's bound
+ * against the C library over a sweep of operands. */
+static void
+fast_inverse_trigonometry_stays_single(void)
+{
+   static const char *const calls[][2] = {
+      {"declare float @air.fast_atan.f32(float)\n", "call float @air.fast_atan.f32(float %a)"},
+      {"declare float @air.fast_asin.f32(float)\n", "call float @air.fast_asin.f32(float %a)"},
+      {"declare float @air.fast_acos.f32(float)\n", "call float @air.fast_acos.f32(float %a)"},
+      {"declare float @air.fast_atan2.f32(float, float)\n",
+       "call float @air.fast_atan2.f32(float %a, float %a)"},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(calls); i++) {
+      char body[512];
+      snprintf(body, sizeof(body),
+               "%%a = load float, ptr addrspace(1) %%out, align 4\n%%r = %s\n"
+               "store float %%r, ptr addrspace(1) %%out, align 4\nret void\n", calls[i][1]);
+      struct stela_air_error error = {0};
+      nir_shader *shader = translate(calls[i][0], body, &nir_options, stela_metal_bind_buffer, &error);
+      assert(shader);
+      unsigned doubles = 0;
+      nir_foreach_block(block, nir_shader_get_entrypoint(shader)) {
+         nir_foreach_instr(instr, block) {
+            doubles += instr->type == nir_instr_type_alu && nir_instr_as_alu(instr)->def.bit_size == 64;
+         }
+      }
+      assert(!doubles);
+      ralloc_free(shader);
+   }
+   static const float operands[] = {0.0f, 1e-30f, 1e-6f, 0.1f, 0.3f, 0.41f, 0.42f, 0.5f, 0.7f,
+                                    0.9f, 0.99f, 0.999999f, 1.0f, 2.0f, 2.5f, 10.0f, 1e6f, 1e30f};
+   for (unsigned i = 0; i < ARRAY_SIZE(operands); i++) {
+      for (int sign = -1; sign <= 1; sign += 2) {
+         float x = sign * operands[i];
+         char call[128], text[24];
+         literal(x, text, sizeof(text));
+         snprintf(call, sizeof(call), "call float @air.fast_atan.f32(float %s)", text);
+         int64_t error = (int64_t)fold("declare float @air.fast_atan.f32(float)\n", "float", call) -
+                         (int64_t)f32(atanf(x));
+         assert(error >= -5 && error <= 5);
+         if (fabsf(x) > 1.0f)
+            continue;
+         snprintf(call, sizeof(call), "call float @air.fast_asin.f32(float %s)", text);
+         error = (int64_t)fold("declare float @air.fast_asin.f32(float)\n", "float", call) -
+                 (int64_t)f32(asinf(x));
+         assert(error >= -5 && error <= 5);
+         snprintf(call, sizeof(call), "call float @air.fast_acos.f32(float %s)", text);
+         error = (int64_t)fold("declare float @air.fast_acos.f32(float)\n", "float", call) -
+                 (int64_t)f32(acosf(x));
+         assert(error >= -5 && error <= 5);
+      }
+   }
+   /* atan2 in every quadrant and on the axes. */
+   static const float pairs[][2] = {{1, 2}, {2, 1}, {-1, 2}, {1, -2}, {-2, -1}, {0, 1}, {0, -1},
+                                    {1, 0}, {-1, 0}, {3, 3}, {-0.5f, 1e-6f}};
+   for (unsigned i = 0; i < ARRAY_SIZE(pairs); i++) {
+      char call[160], y[24], x[24];
+      snprintf(call, sizeof(call), "call float @air.fast_atan2.f32(float %s, float %s)",
+               literal(pairs[i][0], y, sizeof(y)), literal(pairs[i][1], x, sizeof(x)));
+      int64_t error = (int64_t)fold("declare float @air.fast_atan2.f32(float, float)\n", "float", call) -
+                      (int64_t)f32(atan2f(pairs[i][0], pairs[i][1]));
+      assert(error >= -6 && error <= 6);
+   }
+}
+
+/* Narrowing to half rounds as the compile options select. */
+static void
+narrowing_follows_the_rounding_mode(void)
+{
+   const char *body =
+      "%a = load float, ptr addrspace(1) %out, align 4\n"
+      "%r = fptrunc float %a to half\n"
+      "store half %r, ptr addrspace(1) %out, align 2\nret void\n";
+   for (unsigned zero = 0; zero < 2; zero++) {
+      struct stela_air_error error = {0};
+      nir_shader *shader = translate_rounded("", body, &nir_options, stela_metal_bind_buffer, zero, &error);
+      assert(shader);
+      assert(count_alu(shader, nir_op_f2f16_rtz) == zero && count_alu(shader, nir_op_f2f16_rtne) == !zero);
+      ralloc_free(shader);
+   }
+}
+
+/* A backend without a fused multiply-add gets the weak form it can lower. */
+static void
+fma_follows_its_backend(void)
+{
+   const char *declaration = "declare float @llvm.fma.f32(float, float, float)\n";
+   const char *body =
+      "%a = load float, ptr addrspace(1) %out, align 4\n"
+      "%r = call float @llvm.fma.f32(float %a, float %a, float %a)\n"
+      "store float %r, ptr addrspace(1) %out, align 4\nret void\n";
+   nir_shader_compiler_options fused = nir_options;
+   fused.float_mul_add32 = nir_float_muladd_support_has_ffma;
+   struct stela_air_error error = {0};
+   nir_shader *weak = translate(declaration, body, &nir_options, stela_metal_bind_buffer, &error);
+   assert(weak && count_alu(weak, nir_op_ffma_weak) == 1 && !count_alu(weak, nir_op_ffma));
+   ralloc_free(weak);
+   nir_shader *strict = translate(declaration, body, &fused, stela_metal_bind_buffer, &error);
+   assert(strict && count_alu(strict, nir_op_ffma) == 1 && !count_alu(strict, nir_op_ffma_weak));
+   ralloc_free(strict);
+}
+
+/* Every kind of function lowers, and compiles with NAK, on loaded values the
+ * compiler cannot fold: %a, %b and %c of the operand type. */
+static void
+functions_compile(void)
+{
+   static const struct {
+      const char *declaration, *operand, *result, *expression;
+   } functions[] = {
+      {"declare float @air.fast_sin.f32(float)\n", "float", "float", "call float @air.fast_sin.f32(float %a)"},
+      {"declare float @air.fast_tanh.f32(float)\n", "float", "float", "call float @air.fast_tanh.f32(float %a)"},
+      {"declare float @air.fast_acosh.f32(float)\n", "float", "float", "call float @air.fast_acosh.f32(float %a)"},
+      {"declare float @air.fast_exp10.f32(float)\n", "float", "float", "call float @air.fast_exp10.f32(float %a)"},
+      {"declare float @air.fast_cospi.f32(float)\n", "float", "float", "call float @air.fast_cospi.f32(float %a)"},
+      {"declare float @air.fast_atan2.f32(float, float)\n", "float", "float",
+       "call float @air.fast_atan2.f32(float %a, float %b)"},
+      {"declare float @air.fast_pow.f32(float, float)\n", "float", "float",
+       "call float @air.fast_pow.f32(float %a, float %b)"},
+      {"declare float @air.fast_fmod.f32(float, float)\n", "float", "float",
+       "call float @air.fast_fmod.f32(float %a, float %b)"},
+      {"declare float @air.fract.f32(float)\n", "float", "float", "call float @air.fract.f32(float %a)"},
+      {"declare float @air.round.f32(float)\n", "float", "float", "call float @air.round.f32(float %a)"},
+      {"declare float @air.rint.f32(float)\n", "float", "float", "call float @air.rint.f32(float %a)"},
+      {"declare float @air.fdim.f32(float, float)\n", "float", "float",
+       "call float @air.fdim.f32(float %a, float %b)"},
+      {"declare float @air.fmedian3.f32(float, float, float)\n", "float", "float",
+       "call float @air.fmedian3.f32(float %a, float %b, float %c)"},
+      {"declare float @air.mix.f32(float, float, float)\n", "float", "float",
+       "call float @air.mix.f32(float %a, float %b, float %c)"},
+      {"declare float @llvm.fma.f32(float, float, float)\n", "float", "float",
+       "call float @llvm.fma.f32(float %a, float %b, float %c)"},
+      {"", "float", "float", "frem fast float %a, %b"},
+      {"", "float", "float", "fdiv fast float %a, %b"},
+      {"declare half @air.sin.f16(half)\n", "half", "half", "call half @air.sin.f16(half %a)"},
+      {"declare half @air.sqrt.f16(half)\n", "half", "half", "call half @air.sqrt.f16(half %a)"},
+      {"declare half @air.fma.f16(half, half, half)\n", "half", "half",
+       "call half @air.fma.f16(half %a, half %b, half %c)"},
+      {"", "half", "half", "fdiv fast half %a, %b"},
+      {"declare float @air.dot.v3f32(<3 x float>, <3 x float>)\n", "<3 x float>", "float",
+       "call float @air.dot.v3f32(<3 x float> %a, <3 x float> %b)"},
+      {"declare <3 x float> @air.cross.v3f32(<3 x float>, <3 x float>)\n", "<3 x float>", "<3 x float>",
+       "call <3 x float> @air.cross.v3f32(<3 x float> %a, <3 x float> %b)"},
+      {"declare <3 x float> @air.fast_normalize.v3f32(<3 x float>)\n", "<3 x float>", "<3 x float>",
+       "call <3 x float> @air.fast_normalize.v3f32(<3 x float> %a)"},
+      {"declare float @air.fast_distance.v4f32(<4 x float>, <4 x float>)\n", "<4 x float>", "float",
+       "call float @air.fast_distance.v4f32(<4 x float> %a, <4 x float> %b)"},
+      {"declare i32 @air.clz.i32(i32, i1)\n", "i32", "i32", "call i32 @air.clz.i32(i32 %a, i1 false)"},
+      {"declare i64 @air.ctz.i64(i64, i1)\n", "i64", "i64", "call i64 @air.ctz.i64(i64 %a, i1 false)"},
+      {"declare i16 @air.popcount.i16(i16)\n", "i16", "i16", "call i16 @air.popcount.i16(i16 %a)"},
+      {"declare i8 @air.reverse_bits.i8(i8)\n", "i8", "i8", "call i8 @air.reverse_bits.i8(i8 %a)"},
+      {"declare i64 @air.mul_hi.u.i64(i64, i64)\n", "i64", "i64",
+       "call i64 @air.mul_hi.u.i64(i64 %a, i64 %b)"},
+      {"declare i16 @air.add_sat.s.i16(i16, i16)\n", "i16", "i16",
+       "call i16 @air.add_sat.s.i16(i16 %a, i16 %b)"},
+      {"declare i8 @air.sub_sat.u.i8(i8, i8)\n", "i8", "i8", "call i8 @air.sub_sat.u.i8(i8 %a, i8 %b)"},
+      {"declare i32 @air.clamp.u.i32(i32, i32, i32)\n", "i32", "i32",
+       "call i32 @air.clamp.u.i32(i32 %a, i32 %b, i32 %c)"},
+      {"declare half @air.convert.f.f16.s.i32(i32)\n", "i32", "half",
+       "call half @air.convert.f.f16.s.i32(i32 %a)"},
+      {"", "half", "i16", "fptosi half %a to i16"},
+      {"", "float", "i64", "fptoui float %a to i64"},
+      {"", "i64", "float", "uitofp i64 %a to float"},
+      {"", "<2 x half>", "<2 x float>", "fpext <2 x half> %a to <2 x float>"},
+      {"declare <4 x float> @air.sign.v4f32(<4 x float>)\n", "<4 x float>", "<4 x float>",
+       "call <4 x float> @air.sign.v4f32(<4 x float> %a)"},
+      {"declare half @air.nextafter.f16(half, half)\n", "half", "half",
+       "call half @air.nextafter.f16(half %a, half %b)"},
+      {"declare <2 x float> @air.ldexp.v2f32(<2 x float>, <2 x i32>)\n", "<2 x float>", "<2 x float>",
+       "call <2 x float> @air.ldexp.v2f32(<2 x float> %a, <2 x i32> <i32 3, i32 -3>)"},
+      {"declare float @air.fast_sincos.f32(float, ptr)\n", "float", "float",
+       "call float @air.fast_sincos.f32(float %a, ptr %p)"},
+      {"declare <3 x float> @___metal_frexp_v3float_pthreadv3int32(<3 x float>, ptr)\n",
+       "<3 x float>", "<3 x float>",
+       "call <3 x float> @___metal_frexp_v3float_pthreadv3int32(<3 x float> %a, ptr %p)"},
+      {"declare <2 x i32> @___metal_ilogb_v2half(<2 x half>, i32)\n", "<2 x half>", "<2 x i32>",
+       "call <2 x i32> @___metal_ilogb_v2half(<2 x half> %a, i32 0)"},
+      {"declare <2 x i64> @air.mad_sat.s.v2i64(<2 x i64>, <2 x i64>, <2 x i64>)\n", "<2 x i64>",
+       "<2 x i64>", "call <2 x i64> @air.mad_sat.s.v2i64(<2 x i64> %a, <2 x i64> %b, <2 x i64> %c)"},
+      {"declare <4 x i8> @air.rhadd.u.v4i8(<4 x i8>, <4 x i8>)\n", "<4 x i8>", "<4 x i8>",
+       "call <4 x i8> @air.rhadd.u.v4i8(<4 x i8> %a, <4 x i8> %b)"},
+      {"declare <4 x i16> @air.extract_bits.s.v4i16(<4 x i16>, i32, i32)\n", "<4 x i16>", "<4 x i16>",
+       "call <4 x i16> @air.extract_bits.s.v4i16(<4 x i16> %a, i32 3, i32 7)"},
+      {"declare i64 @air.insert_bits.u.i64(i64, i64, i32, i32)\n", "i64", "i64",
+       "call i64 @air.insert_bits.u.i64(i64 %a, i64 %b, i32 40, i32 9)"},
+      {"declare <2 x i64> @air.rotate.v2i64(<2 x i64>, <2 x i64>)\n", "<2 x i64>", "<2 x i64>",
+       "call <2 x i64> @air.rotate.v2i64(<2 x i64> %a, <2 x i64> %b)"},
+      {"declare i32 @air.pack.unorm4x8.srgb.v4f32(<4 x float>)\n", "<4 x float>", "i32",
+       "call i32 @air.pack.unorm4x8.srgb.v4f32(<4 x float> %a)"},
+      /* Precise functions and division. */
+      {"declare <2 x float> @air.sin.v2f32(<2 x float>)\n", "<2 x float>", "<2 x float>",
+       "call <2 x float> @air.sin.v2f32(<2 x float> %a)"},
+      {"declare float @air.pow.f32(float, float)\n", "float", "float",
+       "call float @air.pow.f32(float %a, float %b)"},
+      {"declare float @air.sincos.f32(float, ptr)\n", "float", "float",
+       "call float @air.sincos.f32(float %a, ptr %p)"},
+      {"declare <3 x float> @air.normalize.v3f32(<3 x float>)\n", "<3 x float>", "<3 x float>",
+       "call <3 x float> @air.normalize.v3f32(<3 x float> %a)"},
+      {"declare float @llvm.sqrt.f32(float)\n", "float", "float",
+       "call float @llvm.sqrt.f32(float %a)"},
+      {"declare half @air.tanh.f16(half)\n", "half", "half", "call half @air.tanh.f16(half %a)"},
+      {"", "float", "float", "fdiv float %a, %b"},
+      {"", "half", "half", "fdiv half %a, %b"},
+      {"", "float", "float", "frem nnan float %a, %b"},
+      {"declare <4 x half> @air.unpack.snorm4x8.v4f16(i32)\n", "i32", "<4 x half>",
+       "call <4 x half> @air.unpack.snorm4x8.v4f16(i32 %a)"},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(functions); i++) {
+      const char *t = functions[i].operand;
+      char body[1024];
+      snprintf(body, sizeof(body),
+               "%%p = alloca <4 x i32>, align 16\n"
+               "%%a = load %s, ptr addrspace(1) %%out, align 16\n"
+               "%%pb = getelementptr i8, ptr addrspace(1) %%out, i64 16\n"
+               "%%b = load %s, ptr addrspace(1) %%pb, align 16\n"
+               "%%pc = getelementptr i8, ptr addrspace(1) %%out, i64 32\n"
+               "%%c = load %s, ptr addrspace(1) %%pc, align 16\n"
+               "%%r = %s\nstore %s %%r, ptr addrspace(1) %%out, align 16\nret void\n",
+               t, t, t, functions[i].expression, functions[i].result);
+      struct stela_air_error error = {0};
+      nir_shader *shader = translate(functions[i].declaration, body, &nir_options,
+                                     stela_metal_bind_buffer, &error);
+      if (!shader)
+         fprintf(stderr, "%s: %u %s\n", functions[i].expression, error.kind, error.detail);
+      assert(shader);
+      ralloc_free(shader);
+#ifdef STELA_AIR_TEST_NAK
+      stela_air_test_nak(nak_translate, &(struct fixture){functions[i].declaration, body});
+#endif
+   }
+}
+
+static void
+fragments_take_derivatives_and_discard(void)
+{
+   const char *body =
+      "declare <4 x float> @air.dfdx.v4f32(<4 x float>)\n"
+      "declare <4 x float> @air.fwidth.v4f32(<4 x float>)\n"
+      "declare void @air.discard_fragment()\n"
+      "define <4 x float> @fragment(<4 x float> %position) {\n"
+      "%d = call <4 x float> @air.dfdx.v4f32(<4 x float> %position)\n"
+      "%w = call <4 x float> @air.fwidth.v4f32(<4 x float> %position)\n"
+      "%s = fadd <4 x float> %d, %w\n"
+      "call void @air.discard_fragment()\n"
+      "ret <4 x float> %s\n}\n";
+   const char *metadata =
+      "!air.fragment = !{!2}\n!2 = !{ptr @fragment, !3, !4}\n!3 = !{!30}\n"
+      "!30 = !{!\"air.render_target\", i32 0, i32 0, !\"air.arg_type_name\", !\"float4\","
+      " !\"air.arg_name\", !\"color\"}\n"
+      "!4 = !{!40}\n"
+      "!40 = !{i32 0, !\"air.position\", !\"air.center\", !\"air.no_perspective\","
+      " !\"air.arg_type_name\", !\"float4\", !\"air.arg_name\", !\"position\"}\n";
+   char all[2048];
+   snprintf(all, sizeof(all), "%s%s", metadata, versions);
+   LLVMMemoryBufferRef input = stela_air_test_custom_bitcode(module, body, all, "");
+   struct stela_air_stage_options o = {
+      .stage = STELA_AIR_FRAGMENT, .max_varying_slots = 16,
+      .resources = {.max_instructions = 10000, .bind_buffer = stela_metal_bind_buffer,
+                    .binding_data = &primary, .fp_profile = STELA_AIR_FP_METAL},
+   };
+   struct stela_air_error error = {0};
+   nir_shader *shader = stela_air_stage_to_nir(LLVMGetBufferStart(input), LLVMGetBufferSize(input),
+                                               "fragment", &nir_options, &o, &error);
+   LLVMDisposeMemoryBuffer(input);
+   if (!shader)
+      fprintf(stderr, "fragment: %u %s\n", error.kind, error.detail);
+   assert(shader);
+   unsigned ddx = 0, ddy = 0, demote = 0;
+   nir_foreach_function_impl(impl, shader) {
+      nir_foreach_block(block, impl) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type != nir_instr_type_intrinsic)
+               continue;
+            nir_intrinsic_op op = nir_instr_as_intrinsic(instr)->intrinsic;
+            ddx += op == nir_intrinsic_ddx;
+            ddy += op == nir_intrinsic_ddy;
+            demote += op == nir_intrinsic_demote;
+         }
+      }
+   }
+   assert(ddx == 2 && ddy == 1 && demote == 1);
+   ralloc_free(shader);
+}
+
+/* A double rounded to the nearest half, ties to even, as half bits. */
+static uint16_t
+half_of(double value)
+{
+   if (isnan(value))
+      return 0x7e00;
+   double magnitude = fabs(value);
+   uint16_t sign = signbit(value) ? 0x8000 : 0;
+   if (magnitude >= 65520.0)
+      return sign | 0x7c00;
+   int e;
+   frexp(magnitude, &e);
+   /* A half has 11 significant bits down to 2^-14, then steps of 2^-24. */
+   int quantum = e - 1 >= -14 ? e - 11 : -24;
+   double rounded = ldexp(nearbyint(ldexp(magnitude, -quantum)), quantum);
+   return sign | _mesa_float_to_half((float)rounded);
+}
+
+/* Moves each hardware estimate (reciprocal, square root, inverse square
+ * root, logarithm, exponential) by `error` of itself, the logarithm also by
+ * `error` absolutely, and sines and cosines by twice `error` absolutely, as
+ * the hardware's approximations may err. */
+static void
+perturb_estimates(nir_shader *shader, float error)
+{
+   nir_foreach_block(block, nir_shader_get_entrypoint(shader)) {
+      nir_foreach_instr_safe(instr, block) {
+         if (instr->type != nir_instr_type_alu)
+            continue;
+         nir_alu_instr *alu = nir_instr_as_alu(instr);
+         bool angular = alu->op == nir_op_fsin || alu->op == nir_op_fcos;
+         if (alu->def.bit_size != 32 ||
+             (alu->op != nir_op_frcp && alu->op != nir_op_frsq && alu->op != nir_op_fsqrt &&
+              alu->op != nir_op_flog2 && alu->op != nir_op_fexp2 && !angular))
+            continue;
+         nir_builder b = nir_builder_at(nir_after_instr(instr));
+         nir_def *moved = nir_fmul_imm(&b, &alu->def, 1.0 + error);
+         if (alu->op == nir_op_flog2)
+            moved = nir_fadd_imm(&b, moved, error);
+         /* Sines and cosines err absolutely, by about 2^-21. */
+         if (angular)
+            moved = nir_fadd_imm(&b, &alu->def, 2.0 * error);
+         nir_def_rewrite_uses_after(&alu->def, moved);
+      }
+   }
+}
+
+/* Every bit pattern of a half through `call` (of %a, a half loaded from
+ * %out), folded, against `reference`: correctly rounded where `ulps` is 0,
+ * else within that many ulps, with the hardware's estimates exact or 2^-22
+ * off either way. The translated function has no double. */
+static void
+sweep_half_within(const char *declaration, const char *call, double (*reference)(double),
+                  unsigned ulps, double absolute)
+{
+   char body[512];
+   snprintf(body, sizeof(body),
+            "%%a = load half, ptr addrspace(1) %%out, align 2\n%%r = %s\n"
+            "store half %%r, ptr addrspace(1) %%out, align 2\nret void\n", call);
+   nir_shader *shader = translated(declaration, body);
+   unsigned doubles = 0;
+   nir_intrinsic_instr *load = NULL;
+   nir_foreach_block(block, nir_shader_get_entrypoint(shader)) {
+      nir_foreach_instr(instr, block) {
+         if (instr->type == nir_instr_type_alu)
+            doubles += nir_instr_as_alu(instr)->def.bit_size == 64 &&
+                       nir_op_infos[nir_instr_as_alu(instr)->op].output_type == nir_type_float;
+         if (instr->type == nir_instr_type_intrinsic &&
+             nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_global &&
+             nir_instr_as_intrinsic(instr)->def.bit_size == 16)
+            load = nir_instr_as_intrinsic(instr);
+      }
+   }
+   if (doubles)
+      fprintf(stderr, "%s: %u double operations\n", call, doubles);
+   assert(!doubles && load);
+   unsigned exact = 0, compared = 0, worst = 0;
+   for (uint32_t bits = 0; bits < 0x10000; bits++) {
+      double x = _mesa_half_to_float((uint16_t)bits);
+      uint16_t expected = half_of(reference(x));
+      nir_shader *copy = nir_shader_clone(NULL, shader);
+      nir_intrinsic_instr *loaded = NULL;
+      nir_foreach_block(block, nir_shader_get_entrypoint(copy)) {
+         nir_foreach_instr(instr, block) {
+            if (instr->type == nir_instr_type_intrinsic &&
+                nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_global &&
+                nir_instr_as_intrinsic(instr)->def.bit_size == 16)
+               loaded = nir_instr_as_intrinsic(instr);
+         }
+      }
+      nir_builder b = nir_builder_at(nir_after_instr(&loaded->instr));
+      nir_def_rewrite_uses(&loaded->def, nir_imm_intN_t(&b, bits, 16));
+      static const float errors[] = {0.0f, 0x1p-22f, -0x1p-22f};
+      perturb_estimates(copy, errors[bits % 3]);
+      uint16_t got = (uint16_t)stored(copy, nir_intrinsic_store_global);
+      bool nans = (expected & 0x7fff) > 0x7c00 && (got & 0x7fff) > 0x7c00;
+      if (nans || got == expected) {
+         exact++;
+         compared++;
+         continue;
+      }
+      compared++;
+      int distance = abs((int)(got & 0x7fff) - (int)(expected & 0x7fff));
+      bool same_sign = (got & 0x8000) == (expected & 0x8000);
+      double error = fabs(_mesa_half_to_float(got) - _mesa_half_to_float(expected));
+      if (same_sign && distance > (int)worst)
+         worst = distance;
+      if ((!ulps || !same_sign || distance > (int)ulps) && !(error <= absolute)) {
+         fprintf(stderr, "%s(%a) = 0x%04x, expected 0x%04x\n", call, x, got, expected);
+         assert(false);
+      }
+   }
+   printf("%s: %u of %u halves correctly rounded, at most %u ulp\n", call, exact, compared, worst);
+   ralloc_free(shader);
+}
+
+static void
+sweep_half(const char *declaration, const char *call, double (*reference)(double),
+           unsigned ulps)
+{
+   sweep_half_within(declaration, call, reference, ulps, -1.0);
+}
+
+static double
+reference_rsqrt(double x)
+{
+   return 1.0 / sqrt(x);
+}
+
+static double
+reference_powr_half(double x)
+{
+   return x < 0 ? NAN : pow(x, _mesa_half_to_float(0x3746));
+}
+
+/* The other operand of the half divisions and remainders being swept. */
+static double half_operand;
+
+static double
+reference_divided(double x)
+{
+   return x / half_operand;
+}
+
+static double
+reference_dividing(double x)
+{
+   return half_operand / x;
+}
+
+static double
+reference_remainder(double x)
+{
+   return fmod(x, half_operand);
+}
+
+static double
+reference_remainder_of(double x)
+{
+   return fmod(half_operand, x);
+}
+
+/* Half division and remainder at Metal's precise accuracy, in single
+ * precision: every half divided by and dividing normal, subnormal, largest
+ * and negative halves within an ulp, and remainders exact. */
+static void
+half_division_stays_single(void)
+{
+   static const uint16_t operands[] = {0x4000, 0xc200, 0x2e66, 0x0001, 0x03ff, 0x7bff};
+   for (unsigned i = 0; i < ARRAY_SIZE(operands); i++) {
+      char divided[96], dividing[96], remainder[96], remainder_of[96];
+      snprintf(divided, sizeof(divided), "fdiv half %%a, 0xH%04X", operands[i]);
+      snprintf(dividing, sizeof(dividing), "fdiv half 0xH%04X, %%a", operands[i]);
+      snprintf(remainder, sizeof(remainder), "frem half %%a, 0xH%04X", operands[i]);
+      snprintf(remainder_of, sizeof(remainder_of), "frem half 0xH%04X, %%a", operands[i]);
+      half_operand = _mesa_half_to_float(operands[i]);
+      sweep_half("", divided, reference_divided, 1);
+      sweep_half("", dividing, reference_dividing, 1);
+      sweep_half("", remainder, reference_remainder, 0);
+      sweep_half("", remainder_of, reference_remainder_of, 0);
+   }
+}
+
+static double
+reference_sinpi(double x)
+{
+   double turn = fmod(x, 2.0);
+   return fmod(turn, 1.0) == 0.0 ? copysign(0.0, x) : sin(M_PI * turn);
+}
+
+static double
+reference_cospi(double x)
+{
+   double turn = fmod(x, 2.0);
+   return fmod(turn + 0.5, 1.0) == 0.0 ? 0.0 : cos(M_PI * turn);
+}
+
+static double
+reference_tanpi(double x)
+{
+   return reference_sinpi(x) / reference_cospi(x);
+}
+
+/* The other precise half functions, against Metal's half bounds: 2 ulp or
+ * 2^-10 absolutely, sines, cosines and tangents 2^-8 (the Metal suite's
+ * tolerances). Angles reach 65504. */
+static void
+half_functions_meet_half_bounds(void)
+{
+   static const struct {
+      const char *name;
+      double (*reference)(double);
+      double absolute;
+   } functions[] = {
+      {"sin", sin, 0x1p-8},       {"cos", cos, 0x1p-8},     {"tan", tan, 0x1p-8},
+      {"sinpi", reference_sinpi, 0x1p-8}, {"cospi", reference_cospi, 0x1p-8},
+      {"tanpi", reference_tanpi, 0x1p-8}, {"asin", asin, 0x1p-10}, {"acos", acos, 0x1p-10},
+      {"atan", atan, 0x1p-10},    {"sinh", sinh, 0x1p-10},  {"cosh", cosh, 0x1p-10},
+      {"tanh", tanh, 0x1p-10},    {"asinh", asinh, 0x1p-10}, {"acosh", acosh, 0x1p-10},
+      {"atanh", atanh, 0x1p-10},
+   };
+   for (unsigned i = 0; i < ARRAY_SIZE(functions); i++) {
+      char declaration[96], call[96];
+      snprintf(declaration, sizeof(declaration), "declare half @air.%s.f16(half)\n", functions[i].name);
+      snprintf(call, sizeof(call), "call half @air.%s.f16(half %%a)", functions[i].name);
+      sweep_half_within(declaration, call, functions[i].reference, 2, functions[i].absolute);
+   }
+}
+
+/* Half operands' precise functions evaluate in single precision, with no
+ * double, every half within an ulp. */
+static void
+half_functions_stay_single(void)
+{
+   sweep_half("declare half @air.sqrt.f16(half)\n", "call half @air.sqrt.f16(half %a)", sqrt, 1);
+   sweep_half("declare half @air.rsqrt.f16(half)\n", "call half @air.rsqrt.f16(half %a)",
+              reference_rsqrt, 1);
+   sweep_half("declare half @air.log2.f16(half)\n", "call half @air.log2.f16(half %a)", log2, 1);
+   sweep_half("declare half @air.log.f16(half)\n", "call half @air.log.f16(half %a)", log, 1);
+   sweep_half("declare half @air.log10.f16(half)\n", "call half @air.log10.f16(half %a)", log10, 1);
+   sweep_half("declare half @air.exp2.f16(half)\n", "call half @air.exp2.f16(half %a)", exp2, 1);
+   sweep_half("declare half @air.exp.f16(half)\n", "call half @air.exp.f16(half %a)", exp, 1);
+   sweep_half("declare half @air.exp10.f16(half)\n", "call half @air.exp10.f16(half %a)", exp10, 1);
+   sweep_half("declare half @air.powr.f16(half, half)\n",
+              "call half @air.powr.f16(half %a, half 0xH3746)", reference_powr_half, 1);
+}
+
+int
+main(void)
+{
+   glsl_type_singleton_init_or_ref();
+   setvbuf(stdout, NULL, _IONBF, 0);
+   floating_functions_follow_metal();
+   integer_functions_follow_metal();
+   second_results_store_through_thread_pointers();
+   packing_follows_metal();
+   small_floats_pack_as_vulkan_converts();
+   bools_reduce();
+   conversions_follow_their_names();
+   bfloats_round_to_nearest_even();
+   fast_functions_meet_their_bounds();
+   fast_inverse_trigonometry_stays_single();
+   half_functions_stay_single();
+   half_division_stays_single();
+   half_functions_meet_half_bounds();
+   refuses_misnamed_and_misplaced_functions();
+   half_declares_its_float_controls();
+   fma_follows_its_backend();
+   narrowing_follows_the_rounding_mode();
+   functions_compile();
+   fragments_take_derivatives_and_discard();
+   glsl_type_singleton_decref();
+   puts("air math: ok");
+   return 0;
+}

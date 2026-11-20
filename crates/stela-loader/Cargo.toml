@@ -1,0 +1,48 @@
+[package]
+name = "stela-loader"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Mach-O loading and the restore-image formats of the kernel hand-off"
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = ["std"]
+# Without `std` only the kernel boot-bundle builder (`boot_bundle` and the
+# formats it reads) is built, for `stela.efi`.
+std = ["stela-soc-data/std",
+    "stela-contracts/std", "stela-formats/std",
+    "hex/std",
+    "object/std",
+    "dep:plist",
+    "serde/std",
+    "serde_json/std",
+]
+
+[dependencies]
+stela-soc-data = { path = "../stela-soc-data", default-features = false }
+stela-contracts = { path = "../stela-contracts", default-features = false }
+stela-formats = { path = "../stela-formats", default-features = false }
+stela-driver-core = { path = "../stela-driver-core" }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+object = { version = "0.37", default-features = false, features = ["read"] }
+plist = { version = "1", optional = true }
+serde.workspace = true
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+stela-crypto = { path = "../stela-crypto" }
+# SHA-384 for Image4 manifests; SHA-256 is stela-crypto's.
+sha2 = { version = "0.10", default-features = false }
+
+[dev-dependencies]
+anyhow.workspace = true
+stela-engine = { path = "../stela-engine" }
+# The Realtek drivers' firmware requests, which the pinned files must answer.
+stela-driver-net = { path = "../stela-driver-net" }
+stela-drivers = { path = "../stela-drivers" }
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
+tempfile.workspace = true
+
+[lints]
+workspace = true

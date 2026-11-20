@@ -1,0 +1,9 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
+#ifndef STELA_LIBC_SYS_IOCTL_H
+#define STELA_LIBC_SYS_IOCTL_H
+#include <asm/ioctl.h>
+#include <sys/cdefs.h>
+__BEGIN_DECLS
+int ioctl(int fd, unsigned long request, ...);
+__END_DECLS
+#endif

@@ -1,0 +1,451 @@
+//! Exact PCI control writes derived from a read-only configuration census.
+use super::{ATS, ClaimError, MSI, MSIX, PASID, PCIE, PRI};
+use crate::bus::{
+    mmio::owned::Error as MappingError,
+    pci::{
+        ConfigEffect, ConfigError, ConfigFailure, ConfigSpace,
+        capability::{Capabilities, ExtendedCapabilities, Layout, Transport},
+        regs,
+    },
+};
+use alloc::vec::Vec;
+use core::cell::RefCell;
+
+/// The class and subclass of a host bridge.
+const HOST_BRIDGE: u32 = 0x0600;
+/// The class and subclass of an ISA bridge, which an LPC bridge reports.
+const ISA_BRIDGE: u32 = 0x0601;
+
+#[derive(Clone, Copy)]
+struct Control {
+    offset: u16,
+    original: u16,
+    disabled: u16,
+    /// Bits of `disabled` the function may leave clear (see
+    /// regs::command_optional_bits); every other bit must read back exactly.
+    optional: u16,
+    /// Bits of `original` that `disabled` clears and hardware may hold set:
+    /// only the Bus Master bit of a root-bus host bridge or ISA bridge, or
+    /// of a root-bus Type 1 bridge that forwards no granted bus.
+    hardwired: u16,
+}
+
+/// PCI Express capability device/port types (PCIe 6.0 section 7.5.3.2)
+/// whose bridge may forward transactions under a requester ID of its own.
+const PCIE_TO_PCI_BRIDGE: u8 = 0x7;
+const PCI_TO_PCIE_BRIDGE: u8 = 0x8;
+
+/// The requester IDs other than `own` that a function's DMA may arrive
+/// under: each one a bridge on its route upward forwards it under
+/// ([`Plan::forwarded_requester`]), nearest first, once each. Linux's
+/// `pci_for_each_dma_alias` visits the same IDs; the quirk aliases it adds
+/// for single devices are not included.
+pub fn requester_aliases(own: u16, forwarded: impl IntoIterator<Item = u16>) -> Vec<u16> {
+    let mut aliases = Vec::new();
+    for id in forwarded {
+        if id != own && !aliases.contains(&id) {
+            aliases.push(id);
+        }
+    }
+    aliases
+}
+
+/// This plan describes PCI-level controls only. It conveys no physical
+/// ownership, engine stop, or authority to release old DMA or IRQ state.
+pub struct Plan {
+    controls: Vec<Control>,
+    /// The device/port type of the PCI Express capability, if any.
+    express_port: Option<u8>,
+    /// Why one of the function's capabilities could not be planned, which
+    /// keeps the function from a driver ([`Plan::refusal`]).
+    refusal: Option<ClaimError>,
+}
+
+impl Plan {
+    /// Why the function stays stopped and undriven: a capability whose
+    /// control this plan could not stop exactly, left as found. Bus Master,
+    /// which the plan clears and [`Plan::seal`] holds clear, gates every
+    /// memory request the function makes, MSI and MSI-X messages and
+    /// translation and page requests included (PCI Express Base, Command
+    /// register), so such a function makes no request while it is parked.
+    /// Linux drives it anyway; here it is refused alone instead of the
+    /// census refusing the PC.
+    pub fn refusal(&self) -> Option<ClaimError> {
+        self.refusal
+    }
+
+    /// Record a capability this plan leaves as found. Only a function whose
+    /// Bus Master bit the plan clears may keep one: a hard-wired bit stops no
+    /// request, so there the census is refused as before.
+    fn leave(&mut self, error: ClaimError) -> Result<(), ClaimError> {
+        if self.controls[0].hardwired != 0 {
+            return Err(error);
+        }
+        self.refusal.get_or_insert(error);
+        Ok(())
+    }
+
+    /// Census the function `read` reaches. `root_bus`: it sits on a root
+    /// complex's own bus, which no bridge forwards to. `unrouted`: as a
+    /// Type 1 bridge, its bus fields forward no bus a root bridge grants
+    /// (`stela_boot_core::ecam::forwards_granted_bus`).
+    pub fn read(
+        read: impl FnMut(u16, u8) -> Result<u32, ClaimError>,
+        root_bus: bool,
+        unrouted: bool,
+    ) -> Result<Self, ClaimError> {
+        let reader = RefCell::new(read);
+        let read = |offset, width| reader.borrow_mut()(offset, width);
+        let mut plan = Self {
+            controls: Vec::new(),
+            express_port: None,
+            refusal: None,
+        };
+        let command = read(regs::COMMAND, 2)? as u16;
+        if command == u16::MAX {
+            return Err(ClaimError::ReadFailed {
+                offset: regs::COMMAND,
+            });
+        }
+        // INTx Disable is asked of every function and required of those with
+        // an INTx pin; Bus Master is cleared on all of them and must read
+        // back clear, except on a host bridge or an ISA bridge on a root bus
+        // (the chipset's own functions). Intel hard-wires the Bus Master bit
+        // of both set, AMD that of its FCH LPC bridge, and Linux never
+        // writes either. An ISA bridge's bit covers only LPC masters and
+        // 8237 DMA, which need the legacy DMA controller programmed, and
+        // nothing here programs it. There a set bit that stays set is the
+        // hardware's, and the seal proves it ([`Plan::seal`]). A function
+        // of those classes behind a downstream port is contained like any
+        // other.
+        //
+        // A Type 1 bridge on a root bus whose bus fields forward no bus a
+        // root bridge grants holds no requester behind it: the firmware
+        // enumerates and enables only functions on granted buses, and a
+        // function comes out of reset with Bus Master clear. Its own
+        // requests are MSI and MSI-X messages, whose enables the plan
+        // clears and checks like any other control. Linux never clears a
+        // bridge's Bus Master. Its bit is accepted the same way.
+        let class = read(regs::CLASS_REVISION, 4)? >> 8;
+        let isolated_bridge = unrouted && read(regs::HEADER_TYPE, 1)? & 0x7f == 1;
+        let hardwired =
+            if root_bus && (matches!(class >> 8, HOST_BRIDGE | ISA_BRIDGE) || isolated_bridge) {
+                command & regs::COMMAND_MASTER
+            } else {
+                0
+            };
+        let pin = read(regs::INTERRUPT_PIN, 1)? as u8;
+        plan.push(
+            regs::COMMAND,
+            command,
+            command & !regs::COMMAND_MASTER | regs::COMMAND_INTX_DISABLE,
+            regs::command_optional_bits(pin),
+        )?;
+        plan.controls[0].hardwired = hardwired;
+
+        // Census walks end an odd list where Linux's walk does, so one
+        // function's list never refuses the PC. A control this plan cannot
+        // stop exactly is left as found and the function refused alone
+        // ([`Plan::refusal`]).
+        let mut seen = 0u32;
+        for entry in Capabilities::census(Transport(read)) {
+            let entry = entry?;
+            let id = u16::from(entry.id);
+            let (relative, mut clear, event) = match id {
+                MSI => (2, 1, 0),
+                MSIX => (2, 1 << 15, 0),
+                PCIE => (8, 1 << 11, 0),
+                _ => continue,
+            };
+            let planned = if entry.layout == Layout::Sized {
+                record_capability(&mut seen, id, entry.offset, relative, entry.bytes)
+            } else {
+                Err(ClaimError::UnsupportedCapability {
+                    id,
+                    extended: false,
+                })
+            };
+            match planned {
+                Ok(()) => {
+                    if id == PCIE {
+                        let flags = read(entry.offset + 2, 2)?;
+                        plan.express_port = Some((flags >> 4 & 0xf) as u8);
+                        clear |= device_control_reset(flags as u16);
+                    }
+                    plan.disable(read, entry.offset + relative, clear, event)?;
+                }
+                Err(error) => plan.leave(error)?,
+            }
+        }
+
+        if plan.express_port.is_some() && read(0x100, 4)? != u32::MAX {
+            let mut seen = 0u32;
+            for entry in ExtendedCapabilities::census(Transport(read)) {
+                let entry = entry?;
+                let (relative, clear, event) = match entry.id {
+                    ATS => (6, 1 << 15, 0),
+                    PASID => (6, 1, 0),
+                    PRI => (4, 1, 2), // Reset is a command, not persistent state.
+                    _ => continue,
+                };
+                let planned = if entry.version != 1 {
+                    Err(ClaimError::UnsupportedVersion {
+                        id: entry.id,
+                        version: entry.version,
+                    })
+                } else if entry.layout != Layout::Sized {
+                    Err(ClaimError::MalformedCapability {
+                        offset: entry.offset,
+                    })
+                } else {
+                    record_capability(&mut seen, entry.id, entry.offset, relative, entry.bytes)
+                };
+                match planned {
+                    Ok(()) => plan.disable(read, entry.offset + relative, clear, event)?,
+                    Err(error) => plan.leave(error)?,
+                }
+            }
+        }
+        Ok(plan)
+    }
+
+    fn disable(
+        &mut self,
+        mut read: impl FnMut(u16, u8) -> Result<u32, ClaimError>,
+        offset: u16,
+        clear: u16,
+        event: u16,
+    ) -> Result<(), ClaimError> {
+        let original = read(offset, 2)? as u16;
+        if original == u16::MAX {
+            return Err(ClaimError::ReadFailed { offset });
+        }
+        if original & event != 0 {
+            return Err(ClaimError::Config(ConfigError::before_effect(
+                ConfigFailure::UnqualifiedControl,
+            )));
+        }
+        self.push(offset, original, original & !clear, 0)
+    }
+
+    fn push(
+        &mut self,
+        offset: u16,
+        original: u16,
+        disabled: u16,
+        optional: u16,
+    ) -> Result<(), ClaimError> {
+        if self.controls.iter().any(|control| control.offset == offset) {
+            return Err(ClaimError::MalformedCapability { offset });
+        }
+        self.controls
+            .try_reserve(1)
+            .map_err(|_| ClaimError::Mapping(MappingError::Exhausted))?;
+        self.controls.push(Control {
+            offset,
+            original,
+            disabled,
+            optional,
+            hardwired: 0,
+        });
+        Ok(())
+    }
+
+    /// The requester ID under which this function, as a bridge with
+    /// requester ID `own` and secondary bus `secondary`, may forward the
+    /// DMA of the functions below it; none when it passes on each one's ID
+    /// unchanged, as a PCI Express root port, switch port or port of any
+    /// other type does. As Linux's `pci_for_each_dma_alias`: a PCI Express
+    /// to PCI/PCI-X bridge takes over transactions under its secondary bus
+    /// with device and function 0, and a PCI/PCI-X to PCI Express bridge or
+    /// a bridge without a PCI Express capability under its own ID.
+    pub fn forwarded_requester(&self, own: u16, secondary: u8) -> Option<u16> {
+        match self.express_port {
+            Some(PCIE_TO_PCI_BRIDGE) => Some(u16::from(secondary) << 8),
+            None | Some(PCI_TO_PCIE_BRIDGE) => Some(own),
+            Some(_) => None,
+        }
+    }
+
+    /// Does this exact write narrow one observed control?
+    pub fn permits(&self, offset: u16, width: usize, value: u32) -> bool {
+        width == 2
+            && self.controls.iter().any(|control| {
+                control.offset == offset
+                    && control.original != control.disabled
+                    && u32::from(control.disabled) == value
+            })
+    }
+
+    /// Preflight every old control before issuing any write to this function.
+    /// Recheck each changed word and retain the last write on a later refusal.
+    pub fn apply(&self, config: &mut impl ConfigSpace) -> Result<ConfigEffect, ConfigError> {
+        for &control in &self.controls {
+            verify(
+                control.offset,
+                control.original,
+                0,
+                config.read16(control.offset)?,
+            )?;
+        }
+        let mut effect = ConfigEffect::None;
+        for &control in &self.controls {
+            if control.original != control.disabled {
+                config
+                    .write16(control.offset, control.disabled)
+                    .map_err(|error| with_prefix(error, effect))?;
+                effect = ConfigEffect::WriteMayHaveApplied {
+                    offset: control.offset,
+                    width: 2,
+                };
+                config
+                    .read16(control.offset)
+                    .and_then(|observed| control.verify_disabled(observed))
+                    .map_err(|error| with_prefix(error, effect))?;
+            }
+        }
+        Ok(effect)
+    }
+
+    /// Whether a function whose COMMAND reads `command` masters no DMA
+    /// this plan has not accounted for: its Bus Master bit reads clear, or
+    /// it is a bit this plan lets hardware hold set (a root-bus host bridge,
+    /// ISA bridge or unrouted Type 1 bridge, see [`Plan::read`]). A function that fails its stop
+    /// is judged by this, whatever else it left running.
+    pub fn master_stopped(&self, command: u16) -> bool {
+        command & regs::COMMAND_MASTER == 0
+            || self.controls.iter().any(|control| {
+                control.offset == regs::COMMAND && control.hardwired & regs::COMMAND_MASTER != 0
+            })
+    }
+
+    /// Recheck the stopped controls with a read-only configuration view.
+    pub fn check_disabled(
+        &self,
+        mut read: impl FnMut(u16) -> Result<u16, ConfigError>,
+    ) -> Result<(), ConfigError> {
+        for control in &self.controls {
+            control.verify_disabled(read(control.offset)?)?;
+        }
+        Ok(())
+    }
+
+    /// Acknowledge a contained function: its controls read back stopped,
+    /// then its Bus Master bit is sealed. A clear bit is sealed as clear.
+    /// A set bit is accepted only where this plan lets hardware hold it
+    /// (a root-bus host bridge, ISA bridge or unrouted Type 1 bridge whose
+    /// bit was set) and only
+    /// once the seal proves it hard-wired; anything else is refused.
+    pub fn seal(&self, config: &mut impl MasterSeal) -> Result<(), ConfigError> {
+        self.check_disabled(|offset| config.read16(offset))?;
+        let hardwired = self.controls.iter().find(|control| {
+            control.offset == regs::COMMAND && control.hardwired & regs::COMMAND_MASTER != 0
+        });
+        if let Some(command) = hardwired
+            && config.read16(regs::COMMAND)? & regs::COMMAND_MASTER != 0
+        {
+            config.seal_hardwired_bus_master(command.disabled)
+        } else {
+            config.seal_bus_master()
+        }
+    }
+}
+
+/// The Bus Master seal of a configuration owner: once sealed, no write
+/// through the owner may set COMMAND's Bus Master bit.
+pub trait MasterSeal: ConfigSpace {
+    /// Seal a function whose Bus Master bit reads clear; refuse one whose
+    /// bit reads set.
+    fn seal_bus_master(&mut self) -> Result<(), ConfigError>;
+    /// Seal a function whose Bus Master bit hardware holds set, proven
+    /// by writing the plan's stopped COMMAND, `disabled`, again
+    /// ([`hardwired_master`]): it cannot be cleared, and the chipset's own
+    /// host bridge or ISA bridge, or a bridge with no granted bus behind
+    /// it, masters no DMA Stela has not set up, so it is left as Linux
+    /// leaves it. A bit that clears is sealed as clear
+    /// instead.
+    fn seal_hardwired_bus_master(&mut self, disabled: u16) -> Result<(), ConfigError>;
+}
+
+/// Whether COMMAND's Bus Master bit is hard-wired set: it reads set and
+/// still reads set after COMMAND is written with `disabled`, the plan's
+/// stopped value with that bit clear and the one write containment may
+/// make. A writable bit is left clear by the same write.
+pub fn hardwired_master(config: &mut impl ConfigSpace, disabled: u16) -> Result<bool, ConfigError> {
+    if disabled & regs::COMMAND_MASTER != 0
+        || config.read16(regs::COMMAND)? & regs::COMMAND_MASTER == 0
+    {
+        return Ok(false);
+    }
+    config.write16(regs::COMMAND, disabled)?;
+    Ok(config.read16(regs::COMMAND)? & regs::COMMAND_MASTER != 0)
+}
+
+/// The Device Control bit 15 a stop clears, given the PCI Express
+/// Capabilities register `flags`. On an endpoint, legacy endpoint or
+/// root complex integrated endpoint it is Initiate Function Level Reset,
+/// which reads 0: written back as read it could reset the function, and
+/// written 0 it does nothing, so the stop clears it. On a PCI Express to
+/// PCI bridge it is Bridge Configuration Retry Enable, and on the other
+/// port types it is reserved and kept as read, so the stop keeps it.
+/// Linux writes it on neither.
+fn device_control_reset(flags: u16) -> u16 {
+    const ENDPOINT: u16 = 0x0;
+    const LEGACY_ENDPOINT: u16 = 0x1;
+    const INTEGRATED_ENDPOINT: u16 = 0x9;
+    match flags >> 4 & 0xf {
+        ENDPOINT | LEGACY_ENDPOINT | INTEGRATED_ENDPOINT => 1 << 15,
+        _ => 0,
+    }
+}
+
+fn record_capability(
+    seen: &mut u32,
+    id: u16,
+    offset: u16,
+    relative: u16,
+    bytes: u16,
+) -> Result<(), ClaimError> {
+    let bit = 1 << id;
+    if relative + 2 > bytes || *seen & bit != 0 {
+        return Err(ClaimError::MalformedCapability { offset });
+    }
+    *seen |= bit;
+    Ok(())
+}
+
+impl Control {
+    /// A stopped control reads back its disabled value; an optional bit may
+    /// read back clear instead, and a hardwired bit set as found.
+    fn verify_disabled(&self, observed: u16) -> Result<(), ConfigError> {
+        verify(
+            self.offset,
+            self.disabled,
+            self.optional | self.hardwired,
+            observed,
+        )
+    }
+}
+
+/// Compare every bit outside `optional`.
+fn verify(offset: u16, expected: u16, optional: u16, observed: u16) -> Result<(), ConfigError> {
+    if (expected ^ observed) & !optional != 0 {
+        return Err(ConfigError::before_effect(ConfigFailure::Readback {
+            offset,
+            width: 2,
+            expected: u32::from(expected),
+            observed: u32::from(observed),
+        }));
+    }
+    Ok(())
+}
+
+fn with_prefix(error: ConfigError, prefix: ConfigEffect) -> ConfigError {
+    match error.effect {
+        ConfigEffect::None => ConfigError {
+            effect: prefix,
+            ..error
+        },
+        ConfigEffect::WriteMayHaveApplied { .. } => error,
+    }
+}

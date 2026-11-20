@@ -1,0 +1,35 @@
+## Install
+
+Download the archive for your system, unpack it and plug in the USB stick. Then run one of these in the unpacked folder.
+
+Make a new stick (this erases it):
+
+```
+sudo ./stela
+```
+
+Update an existing Stela stick to v@VERSION@:
+
+```
+sudo ./stela update
+```
+
+On Windows, open Terminal with Run as administrator and write `.\stela.exe` in place of `sudo ./stela`.
+
+On macOS, stela is not notarized. If macOS says it cannot be opened, run this once in the unpacked folder:
+
+```
+xattr -d com.apple.quarantine stela
+```
+
+Then boot the PC from the stick.
+
+## Changes
+
+## Boot log
+
+If Stela does not work, save the boot log and include `log.txt` in your report:
+
+```
+sudo ./stela log --output log.txt
+```

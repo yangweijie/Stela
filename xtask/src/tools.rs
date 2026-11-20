@@ -1,0 +1,111 @@
+//! Process and path helpers shared by tasks.
+use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
+use std::{
+    env,
+    ffi::OsStr,
+    fs,
+    path::{Path, PathBuf},
+    process::{Child, Command, ExitStatus},
+    thread,
+    time::{Duration, Instant},
+};
+use stela_formats::sha256;
+
+pub fn root() -> &'static Path {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("xtask lives in the repository root")
+}
+
+/// The cargo that launched this task, so nested builds share its toolchain.
+pub fn cargo() -> Command {
+    let mut command = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+    command.current_dir(root());
+    command
+}
+
+/// The environment variable that names the Apple silicon Mac reference tools
+/// reach over ssh.
+pub const MAC_VARIABLE: &str = "STELA_MAC";
+
+/// The Mac's ssh name: `given`, else `STELA_MAC`.
+pub fn mac_host(given: Option<String>) -> Result<String> {
+    given
+        .or_else(|| env::var(MAC_VARIABLE).ok())
+        .filter(|host| !host.is_empty())
+        .with_context(|| format!("no Mac: pass --mac or --host, or set {MAC_VARIABLE}"))
+}
+
+pub fn exec(command: &mut Command) -> Result<()> {
+    let status = command
+        .status()
+        .with_context(|| format!("cannot start {:?}", command.get_program()))?;
+    if !status.success() {
+        bail!("{command:?} failed with {status}");
+    }
+    Ok(())
+}
+
+pub fn which(name: impl AsRef<OsStr>) -> Option<PathBuf> {
+    let mut name = name.as_ref().to_owned();
+    name.push(env::consts::EXE_SUFFIX);
+    env::split_paths(&env::var_os("PATH")?)
+        .map(|directory| directory.join(&name))
+        .find(|path| path.is_file())
+}
+
+/// Locate a tool bundled with the active Rust toolchain.
+pub fn toolchain_llvm_tool(name: &str) -> Option<PathBuf> {
+    let output = Command::new(env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()?;
+    let sysroot = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+    fs::read_dir(sysroot.join("lib/rustlib"))
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| {
+            entry
+                .path()
+                .join("bin")
+                .join(format!("{name}{}", env::consts::EXE_SUFFIX))
+        })
+        .find(|path| path.is_file())
+}
+
+pub fn qemu() -> Result<PathBuf> {
+    let local = root().join(".tools/qemu/bin/qemu-system-x86_64");
+    if local.exists() {
+        return Ok(local);
+    }
+    which("qemu-system-x86_64").context("install QEMU 11 or newer")
+}
+
+/// Path, size and digest of one input or output file.
+pub fn binding(path: &Path) -> Result<Value> {
+    let data = fs::read(path).with_context(|| format!("cannot read {}", path.display()))?;
+    Ok(json!({ "path": path, "bytes": data.len(), "sha256": sha256(&data) }))
+}
+
+/// Wait for `child` until `timeout`, then terminate it. Returns `None` on timeout.
+pub fn wait(child: &mut Child, timeout: Duration) -> Result<Option<ExitStatus>> {
+    let Some(deadline) = Instant::now().checked_add(timeout) else {
+        return Ok(Some(child.wait()?));
+    };
+    while Instant::now() < deadline {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    stop(child);
+    Ok(None)
+}
+
+pub fn stop(child: &mut Child) {
+    if matches!(child.try_wait(), Ok(None)) {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}

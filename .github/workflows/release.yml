@@ -1,0 +1,379 @@
+# One self-contained `stela` per platform. `stela` embeds stela.efi, which
+# carries the StelaGPU kext; the kext carries the Metal bundle and Stela.app.
+# So the chain runs: Stela.app (macOS) -> stela.efi (Linux) -> stela for
+# Linux, Windows and macOS -> release.
+#
+# Runs only for a pushed `v*` tag, and publishes that tag's release.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  # Stela.app's sources, with their build.sh.
+  APP: guest/stela-app
+  # The release body and each archive's INSTALL.txt:
+  # plain text that also reads as Markdown, with @VERSION@ for the version.
+  NOTES: .github/release-notes.txt
+
+jobs:
+  version:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check the tag against the workspace version
+        id: version
+        run: |
+          version="$(awk '/^\[workspace.package\]/{s=1;next} s && /^\[/{exit} s && /^version = /{gsub(/"/,"",$3);print $3;exit}' Cargo.toml)"
+          if [[ -z "$version" ]]; then
+            echo "::error::Cargo.toml has no [workspace.package] version"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match the workspace version $version (expected v$version)"
+            exit 1
+          fi
+          for path in LICENSE NOTICE LICENSES; do
+            if [[ ! -e "$path" ]]; then
+              echo "::error::$path is missing; a release ships LICENSE, NOTICE and LICENSES/"
+              exit 1
+            fi
+          done
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+  app:
+    needs: version
+    runs-on: macos-26
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Build Stela.app
+        run: |
+          swift --version
+          # build.sh prints the bundle's path last.
+          app="$(bash "$APP/build.sh" | tee /dev/stderr | tail -1)"
+          [[ -f "$app/Contents/Info.plist" ]] || { echo "::error::$APP/build.sh named no app bundle: $app"; exit 1; }
+          # tar keeps the bundle's modes and code signature byte for byte.
+          tar -C "$(dirname "$app")" -cf Stela.app.tar Stela.app
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stela-app
+          path: Stela.app.tar
+          if-no-files-found: error
+          retention-days: 7
+
+  efi:
+    needs: [version, app]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 330
+    env:
+      SOURCE: stela-v${{ needs.version.outputs.version }}-source
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Clang 21
+        run: |
+          # The kext needs upstream Clang 21 or newer for arm64e.
+          curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
+          sudo apt-get update -q
+          sudo apt-get install -y -q --no-install-recommends clang-21 lld-21 llvm-21 libclang-21-dev
+          echo /usr/lib/llvm-21/bin >> "$GITHUB_PATH"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-efi-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock', 'crates/stela-boot/Cargo.lock') }}
+          restore-keys: cargo-efi-${{ hashFiles('rust-toolchain.toml') }}-
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustc --version
+          version="$(clang --version)"
+          echo "${version%%$'\n'*}"
+          [[ "$version" =~ version\ (2[1-9]|[3-9][0-9])\. ]] || { echo "::error::clang on PATH is older than 21"; exit 1; }
+
+      - name: Cache keys
+        id: keys
+        run: |
+          pins="$(git ls-tree HEAD third_party | sha256sum | cut -c1-16)"
+          tools="$(printf '%s\n%s\n' "$(clang --version | head -1)" "$(rustc --version)" | sha256sum | cut -c1-16)"
+          echo "nvk=$pins-$tools" >> "$GITHUB_OUTPUT"
+          # The tools' virtual environment names the image's Python.
+          echo "image=$ImageOS-$ImageVersion" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/cache@v4
+        with:
+          path: .tools/gpu
+          key: gpu-tools-${{ steps.keys.outputs.image }}-${{ hashFiles('xtask/src/gpu/toolchain.rs') }}
+
+      # Mesa and LLVM compiled for stela.efi. Only an exact key restores:
+      # it covers every input of `target/gpu`.
+      - uses: actions/cache@v4
+        id: nvk
+        with:
+          path: target/gpu
+          key: nvk-${{ steps.keys.outputs.nvk }}-${{ hashFiles('xtask/src/gpu/**', 'crates/stela-driver-gpu/**', 'third_party/patches/**', 'third_party/*.sparse') }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: stela-app
+          path: app
+
+      - name: Unpack Stela.app
+        run: |
+          tar -C app -xf app/Stela.app.tar
+          echo "STELA_APP=$PWD/app/Stela.app" >> "$GITHUB_ENV"
+
+      - name: Fetch upstream sources
+        run: cargo xtask gpu fetch
+
+      # The complete corresponding source: the tracked tree (with
+      # third_party/patches) and each submodule's files at its pin, limited
+      # to the sparse paths `gpu fetch` checks out. GitHub's tag archives
+      # leave submodules out.
+      - name: Source archive
+        run: |
+          export LC_ALL=C
+          stage="$RUNNER_TEMP/source"
+          rm -rf "$stage" && mkdir -p "$stage"
+          git archive --format=tar --prefix="$SOURCE/" HEAD | tar -x -C "$stage"
+          index="$RUNNER_TEMP/source.index"
+          git config -f .gitmodules --get-regexp '^submodule\..*\.path$' | while read -r _ path; do
+            pin="$(git ls-files --stage -- "$path" | cut -d' ' -f2)"
+            # Tracked files outside the sparse set are marked S (skip-worktree).
+            git -C "$path" -c core.quotePath=false ls-files -v | sed -n 's/^[^S] //p' | sort > "$RUNNER_TEMP/sparse"
+            git -C "$path" -c core.quotePath=false ls-tree -r --name-only "$pin" | sort > "$RUNNER_TEMP/pinned"
+            comm -12 "$RUNNER_TEMP/sparse" "$RUNNER_TEMP/pinned" > "$RUNNER_TEMP/files"
+            rm -f "$index"
+            GIT_INDEX_FILE="$index" git -C "$path" read-tree "$pin"
+            GIT_INDEX_FILE="$index" git -C "$path" checkout-index --prefix="$stage/$SOURCE/$path/" --stdin < "$RUNNER_TEMP/files"
+            echo "$path $pin: $(wc -l < "$RUNNER_TEMP/files") files"
+          done
+          mkdir -p dist
+          tar -C "$stage" -cf - "$SOURCE" | zstd -q -T0 -15 -o "dist/$SOURCE.tar.zst"
+          rm -rf "$stage" "$index"
+          ls -l "dist/$SOURCE.tar.zst"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.SOURCE }}
+          path: dist/${{ env.SOURCE }}.tar.zst
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Keep the restored Mesa and LLVM build current
+        if: steps.nvk.outputs.cache-hit == 'true'
+        run: |
+          # A fresh checkout is newer than the restored objects; the key
+          # proved the sources the same, so date them before the objects.
+          find third_party crates/stela-driver-gpu -path '*/.git' -prune -o -type f -print0 \
+            | xargs -0 touch -h -d '2000-01-01T00:00:00Z'
+
+      - name: Build stela.efi
+        run: |
+          cargo xtask boot build --release
+          efi=target/boot/x86_64-unknown-uefi/release/stela-deploy.efi
+          [[ "$(head -c 2 "$efi")" == MZ ]] || { echo "::error::$efi is not a PE image"; exit 1; }
+          cp "$efi" dist/stela.efi
+          ls -l dist/stela.efi
+          { echo "stela.efi: $(stat -c %s dist/stela.efi) bytes"; echo "sha256 $(sha256sum dist/stela.efi | cut -d' ' -f1)"; } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stela-efi
+          path: dist/stela.efi
+          if-no-files-found: error
+          retention-days: 7
+
+  cli:
+    needs: [version, efi]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # glibc 2.35: Ubuntu 22.04, Debian 12, Fedora 36 and newer.
+          - os: ubuntu-22.04
+            platform: linux-x86_64
+            targets: x86_64-unknown-linux-gnu
+          - os: windows-2025
+            platform: windows-x86_64
+            targets: x86_64-pc-windows-msvc
+          - os: macos-26
+            platform: macos-universal
+            targets: aarch64-apple-darwin x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    env:
+      ARCHIVE: stela-v${{ needs.version.outputs.version }}-${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Put LLVM on PATH
+        run: |
+          # The C build passes --no-default-config, which Clang 16 and newer
+          # take; Linux uses the LLVM 21 the boot program builds with.
+          case "$RUNNER_OS" in
+            Windows) echo 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH" ;;
+            Linux)
+              curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+              release="$(lsb_release -cs)"
+              echo "deb http://apt.llvm.org/$release/ llvm-toolchain-$release-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
+              sudo apt-get update -q
+              sudo apt-get install -y -q --no-install-recommends clang-21 llvm-21
+              echo /usr/lib/llvm-21/bin >> "$GITHUB_PATH"
+              ;;
+          esac
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-cli-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-cli-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustup target add ${{ matrix.targets }}
+          rustc --version
+          # stela-tls compiles Mbed TLS with clang on every host, and
+          # archives it with llvm-lib for Windows.
+          tools=clang
+          [[ "$RUNNER_OS" == Windows ]] && tools="clang llvm-lib"
+          for tool in $tools; do
+            command -v "$tool" >/dev/null || { echo "::error::$tool is not on PATH"; exit 1; }
+          done
+          clang --version | head -1
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: stela-efi
+          path: efi
+
+      - name: Build stela
+        run: |
+          export STELA_EFI="$PWD/efi/stela.efi"
+          for target in ${{ matrix.targets }}; do
+            cargo build --release --locked -p stela-cli --target "$target"
+          done
+          mkdir -p "$ARCHIVE"
+          case "$RUNNER_OS" in
+            Windows) cp target/x86_64-pc-windows-msvc/release/stela.exe "$ARCHIVE/" ;;
+            macOS)
+              lipo -create -output "$ARCHIVE/stela" \
+                target/aarch64-apple-darwin/release/stela target/x86_64-apple-darwin/release/stela
+              codesign --force --sign - "$ARCHIVE/stela"
+              lipo -info "$ARCHIVE/stela"
+              ;;
+            *) cp target/x86_64-unknown-linux-gnu/release/stela "$ARCHIVE/" ;;
+          esac
+
+      - name: Check stela
+        run: |
+          binary="$(ls "$ARCHIVE"/stela*)"
+          expected="stela ${{ needs.version.outputs.version }}"
+          actual="$("$binary" --version)"
+          [[ "$actual" == "$expected" ]] || { echo "::error::$binary --version printed '$actual', not '$expected'"; exit 1; }
+          python=python3
+          if [[ "$RUNNER_OS" == Windows ]]; then python=python; fi
+          "$python" -c 'import sys; sys.exit(open(sys.argv[1], "rb").read() not in open(sys.argv[2], "rb").read())' efi/stela.efi "$binary" \
+            || { echo "::error::$binary does not hold the stela.efi the efi job built"; exit 1; }
+          size="$(wc -c < "$binary")"
+          "$binary" create --help >/dev/null
+          echo "$ARCHIVE: $size bytes" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Package
+        run: |
+          # The archive's copy has no Changes heading: that section lives on the release.
+          sed -e "s/@VERSION@/${{ needs.version.outputs.version }}/g" -e '/^## Changes$/{N;d;}' "$NOTES" > "$ARCHIVE/INSTALL.txt"
+          cp -R LICENSE NOTICE LICENSES "$ARCHIVE/"
+          if [[ "$RUNNER_OS" == Windows ]]; then
+            7z a -tzip -bso0 "$ARCHIVE.zip" "$ARCHIVE"
+          else
+            tar -czf "$ARCHIVE.tar.gz" "$ARCHIVE"
+          fi
+          ls -l "$ARCHIVE".*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARCHIVE }}
+          path: ${{ env.ARCHIVE }}.*
+          if-no-files-found: error
+          compression-level: 0
+
+  release:
+    needs: [version, cli]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: stela-v*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums and notes
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          count="$(ls dist | wc -l)"
+          [[ "$count" == 4 ]] || { echo "::error::expected 3 archives and the source, found $count: $(ls dist)"; exit 1; }
+          (cd dist && sha256sum -- * > SHA256SUMS && cat SHA256SUMS)
+          # The template's Changes section is empty: it is written by hand
+          # on the published release.
+          grep -qx '## Changes' "$NOTES" || { echo "::error::$NOTES is missing or has no Changes heading"; exit 1; }
+          sed "s/@VERSION@/$VERSION/g" "$NOTES" > notes.txt
+          if grep -n '@[A-Z_]*@' notes.txt; then
+            echo "::error::$NOTES has a placeholder other than @VERSION@"
+            exit 1
+          fi
+          wc -l notes.txt
+
+      # A re-run replaces the files of a release that exists and keeps its
+      # text, so a Changes section written by hand stays.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME exists: replacing its files, keeping its text"
+            gh release upload "$GITHUB_REF_NAME" dist/* --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* \
+              --verify-tag \
+              --title "Stela $GITHUB_REF_NAME" \
+              --notes-file notes.txt
+          fi

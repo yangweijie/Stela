@@ -1,0 +1,108 @@
+//! SVE operands shared by the SVE instruction families.
+use crate::aarch64::Unsupported;
+
+pub mod address;
+pub mod dot;
+pub mod floating;
+pub mod floating_copy;
+pub mod integer_arithmetic;
+pub mod integer_bits;
+pub mod integer_comparison;
+pub mod integer_logic;
+pub mod integer_predicate_move;
+pub mod integer_products;
+pub mod integer_saturation;
+pub mod memory;
+pub mod memory_load;
+pub mod memory_multi;
+pub mod memory_store;
+pub mod memory_structure;
+pub mod predicate_generation;
+pub mod predicate_logic;
+pub mod prefix;
+pub mod rearrange;
+pub mod rearrange_extract;
+pub mod rearrange_widen;
+pub mod reductions;
+pub mod shifts;
+pub mod shifts_narrow;
+pub mod sign;
+pub mod tables;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operand {
+    Address(address::Operand),
+    Dot(dot::Operand),
+    FloatingCopy(floating_copy::Operand),
+    IntegerArithmetic(integer_arithmetic::Operand),
+    IntegerBits(integer_bits::Operand),
+    IntegerComparison(integer_comparison::Operand),
+    IntegerLogic(integer_logic::Operand),
+    IntegerPredicateMove(integer_predicate_move::Operand),
+    IntegerProducts(integer_products::Operand),
+    IntegerSaturation(integer_saturation::Operand),
+    MemoryLoad(memory_load::Operand),
+    MemoryMulti(memory_multi::Operand),
+    MemoryStore(memory_store::Operand),
+    MemoryStructure(memory_structure::Operand),
+    PredicateGeneration(predicate_generation::Operand),
+    PredicateLogic(predicate_logic::Operand),
+    Rearrange(rearrange::Operand),
+    RearrangeExtract(rearrange_extract::Operand),
+    RearrangeWiden(rearrange_widen::Operand),
+    Reductions(reductions::Operand),
+    Shifts(shifts::Operand),
+    ShiftsNarrow(shifts_narrow::Operand),
+    Sign(sign::Operand),
+    Tables(tables::Operand),
+}
+
+pub fn decode(word: u32) -> Option<Result<Operand, Unsupported>> {
+    tables::decode(word)
+        .map(|operand| operand.map(Operand::Tables))
+        .or_else(|| address::decode(word).map(|operand| operand.map(Operand::Address)))
+        .or_else(|| dot::decode_integer(word).map(|operand| operand.map(Operand::Dot)))
+        .or_else(|| integer_bits::decode(word).map(|operand| operand.map(Operand::IntegerBits)))
+        .or_else(|| integer_logic::decode(word).map(|operand| operand.map(Operand::IntegerLogic)))
+        .or_else(|| {
+            integer_predicate_move::decode(word)
+                .map(|operand| operand.map(Operand::IntegerPredicateMove))
+        })
+        .or_else(|| {
+            integer_arithmetic::decode(word).map(|operand| operand.map(Operand::IntegerArithmetic))
+        })
+        .or_else(|| {
+            integer_products::decode(word).map(|operand| operand.map(Operand::IntegerProducts))
+        })
+        .or_else(|| {
+            integer_saturation::decode(word).map(|operand| operand.map(Operand::IntegerSaturation))
+        })
+        .or_else(|| memory_load::decode(word).map(|operand| operand.map(Operand::MemoryLoad)))
+        .or_else(|| memory_multi::decode(word).map(|operand| operand.map(Operand::MemoryMulti)))
+        .or_else(|| memory_store::decode(word).map(|operand| operand.map(Operand::MemoryStore)))
+        .or_else(|| {
+            memory_structure::decode(word).map(|operand| operand.map(Operand::MemoryStructure))
+        })
+        .or_else(|| {
+            predicate_generation::decode(word)
+                .map(|operand| operand.map(Operand::PredicateGeneration))
+        })
+        .or_else(|| {
+            predicate_logic::decode(word).map(|operand| operand.map(Operand::PredicateLogic))
+        })
+        .or_else(|| {
+            rearrange_extract::decode(word).map(|operand| operand.map(Operand::RearrangeExtract))
+        })
+        .or_else(|| {
+            rearrange_widen::decode(word).map(|operand| operand.map(Operand::RearrangeWiden))
+        })
+        .or_else(|| rearrange::decode(word).map(|operand| operand.map(Operand::Rearrange)))
+        .or_else(|| reductions::decode(word).map(|operand| operand.map(Operand::Reductions)))
+        .or_else(|| {
+            integer_comparison::decode(word).map(|operand| operand.map(Operand::IntegerComparison))
+        })
+        .or_else(|| shifts::decode(word).map(|operand| operand.map(Operand::Shifts)))
+        .or_else(|| shifts_narrow::decode(word).map(|operand| operand.map(Operand::ShiftsNarrow)))
+        .or_else(|| sign::decode(word).map(|operand| operand.map(Operand::Sign)))
+        .or_else(|| floating_copy::decode(word).map(|operand| operand.map(Operand::FloatingCopy)))
+}

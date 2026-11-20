@@ -1,0 +1,39 @@
+[package]
+name = "stela-driver-base"
+version.workspace = true
+edition.workspace = true
+# Stela's own code is GPL-2.0-or-later; Linux-derived bus and platform code
+# retains its GPL notices, and ACPICA keeps its BSD terms.
+license = "GPL-2.0-or-later AND GPL-2.0-only AND BSD-3-Clause"
+description = "Foundation of Stela's PC drivers: buses, DMA, MMIO, block devices, ACPI and clocks"
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+# Native x86 ACPICA interpreter; builds freestanding C with clang.
+native-acpi = ["dep:cc", "dep:stela-c-build"]
+# The work and page services the native Linux kernel services call.
+linux-kernel = []
+# `block::RamDisk`, the in-memory disk the runtime's tests run models on.
+ram-disk = []
+# The virtual clock and models other driver crates' tests share.
+test-support = []
+# Explicit bounded boot IRQ diagnostics, never native-service delivery.
+irq-diagnostics = []
+
+[dependencies]
+stela-driver-core = { path = "../stela-driver-core" }
+stela-contracts = { path = "../stela-contracts", default-features = false }
+# Fallible native mapping metadata; the maintained owner supports alloc-only UEFI.
+triomphe = { version = "=0.1.16", default-features = false }
+
+[dev-dependencies]
+sha2 = { version = "0.10", default-features = false }
+
+[build-dependencies]
+cc = { version = "1", optional = true }
+stela-c-build = { path = "../stela-c-build", optional = true }

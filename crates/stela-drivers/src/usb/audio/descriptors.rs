@@ -1,0 +1,915 @@
+// SPDX-License-Identifier: GPL-2.0-only
+//! UAC2 descriptor layouts from Linux include/linux/usb/audio-v2.h and
+//! sound/usb/format.c. All IDs and relationships come from runtime descriptors.
+use super::{CLASS, CONTROL_SUBCLASS, Control, Error, STREAMING_SUBCLASS, UAC2};
+use crate::bytes::{le16, le32};
+use crate::{
+    audio::Direction,
+    usb::descriptor::{
+        ENDPOINT_DESCRIPTOR, Endpoint, INTERFACE_ASSOCIATION_DESCRIPTOR, INTERFACE_DESCRIPTOR,
+        Interface, setup,
+    },
+    usb::xhci::{FULL_SPEED, HIGH_SPEED},
+};
+use alloc::vec::Vec;
+
+const CS_INTERFACE: u8 = 0x24;
+const CS_ENDPOINT: u8 = 0x25;
+const ISOCHRONOUS: u8 = 1;
+/// bmAttributes usage type (USB 2.0 Table 9-13).
+const USAGE: u8 = 0x30;
+const FEEDBACK: u8 = 0x10;
+const IMPLICIT_FEEDBACK: u8 = 0x20;
+const USB_STREAMING: u16 = 0x0101;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Entity {
+    ClockSource {
+        id: u8,
+        /// bmAttributes: clock type in bits 1:0, 0 for external.
+        attributes: u8,
+        controls: u8,
+    },
+    ClockSelector {
+        id: u8,
+        sources: Vec<u8>,
+        controls: u8,
+    },
+    ClockMultiplier {
+        id: u8,
+        source: u8,
+        controls: u8,
+    },
+    Input {
+        id: u8,
+        terminal_type: u16,
+        clock: u8,
+        channels: u8,
+        channel_config: u32,
+    },
+    Output {
+        id: u8,
+        terminal_type: u16,
+        source: u8,
+        clock: u8,
+    },
+    Mixer {
+        id: u8,
+        sources: Vec<u8>,
+        channels: u8,
+        channel_config: u32,
+        /// Flattened input/output crosspoints, MSB-first as specified by USB audio.
+        matrix: Vec<u8>,
+        /// UAC2 unit event controls; UAC1 has no such field.
+        unit_controls: Option<u32>,
+    },
+    Feature {
+        id: u8,
+        source: u8,
+        controls: Vec<u32>,
+    },
+    Selector {
+        id: u8,
+        sources: Vec<u8>,
+        controls: u8,
+    },
+    /// Effect, processing, extension and sample rate converter units. Like
+    /// Linux `check_input_term`, the signal passes through them; their
+    /// controls stay at the device defaults and are not exposed.
+    Processing {
+        id: u8,
+        /// The class-specific descriptor subtype of the unit.
+        subtype: u8,
+        sources: Vec<u8>,
+        /// Converter input and output clocks; empty for other units.
+        clocks: Vec<u8>,
+        /// The declared output cluster; `None` keeps the source cluster, as
+        /// effect units and sample rate converters do.
+        cluster: Option<(u8, u32)>,
+        /// Whether the unit advertises any control.
+        controls: bool,
+    },
+}
+impl Entity {
+    pub fn id(&self) -> u8 {
+        match self {
+            Self::ClockSource { id, .. }
+            | Self::ClockSelector { id, .. }
+            | Self::ClockMultiplier { id, .. }
+            | Self::Input { id, .. }
+            | Self::Output { id, .. }
+            | Self::Mixer { id, .. }
+            | Self::Feature { id, .. }
+            | Self::Selector { id, .. }
+            | Self::Processing { id, .. } => *id,
+        }
+    }
+}
+
+/// Parse a UAC1 or UAC2 processing or extension unit. Both declare `p`
+/// source pins at byte 7 and their own output cluster after them; UAC1 then
+/// has a sized control bitmap, UAC2 a fixed one. Processing units may carry
+/// process-specific bytes after the string index; extension units do not.
+pub(super) fn processing_unit(d: &[u8], protocol: u8, extension: bool) -> Result<Entity, Error> {
+    let short = || Error::Descriptor("short/invalid USB audio processing unit");
+    let pins = usize::from(*d.get(6).ok_or_else(short)?);
+    let after = 7 + pins;
+    let (cluster, controls, end) = if protocol == super::UAC1 {
+        // bNrChannels, wChannelConfig, iChannelNames, bControlSize.
+        let size = usize::from(*d.get(after + 4).ok_or_else(short)?);
+        let bitmap = d.get(after + 5..after + 5 + size).ok_or_else(short)?;
+        (
+            (d[after], u32::from(le16(d, after + 1))),
+            bitmap.iter().any(|byte| *byte != 0),
+            after + 6 + size,
+        )
+    } else {
+        // bNrChannels, bmChannelConfig, iChannelNames, then bmControls
+        // (two bytes for processing units, one for extension units).
+        let width = if extension { 1 } else { 2 };
+        let bitmap = d.get(after + 6..after + 6 + width).ok_or_else(short)?;
+        (
+            (d[after], le32(d, after + 1)),
+            bitmap.iter().any(|byte| *byte != 0),
+            after + 7 + width,
+        )
+    };
+    if d.len() < end || (extension && d.len() != end) {
+        return Err(short());
+    }
+    Ok(Entity::Processing {
+        id: d[3],
+        subtype: d[2],
+        sources: d[7..after].to_vec(),
+        clocks: Vec::new(),
+        cluster: Some(cluster),
+        controls,
+    })
+}
+
+/// Units whose controls are left at the device defaults, reported once per
+/// function at its control interface.
+pub(super) fn unexposed_controls(graph: &Graph) -> Option<(u8, u8, &'static str)> {
+    graph
+        .entities
+        .iter()
+        .any(|entity| matches!(entity, Entity::Processing { controls: true, .. }))
+        .then_some((
+            graph.control_interface,
+            0,
+            "USB audio processing/extension unit controls left at device defaults",
+        ))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Graph {
+    pub protocol: u8,
+    pub control_interface: u8,
+    pub entities: Vec<Entity>,
+}
+impl Graph {
+    pub fn entity(&self, id: u8) -> Result<&Entity, Error> {
+        self.entities
+            .iter()
+            .find(|entity| entity.id() == id)
+            .ok_or(Error::Descriptor("dangling UAC2 entity reference"))
+    }
+    pub fn terminal_clock(&self, terminal: u8, direction: Direction) -> Result<u8, Error> {
+        match (self.entity(terminal)?, direction) {
+            (
+                Entity::Input {
+                    terminal_type: USB_STREAMING,
+                    clock,
+                    ..
+                },
+                Direction::Playback,
+            )
+            | (
+                Entity::Output {
+                    terminal_type: USB_STREAMING,
+                    clock,
+                    ..
+                },
+                Direction::Capture,
+            ) => Ok(*clock),
+            _ => Err(Error::Descriptor(
+                "AS terminal link has the wrong direction/type",
+            )),
+        }
+    }
+    pub(super) fn validate(&self) -> Result<(), Error> {
+        for entity in &self.entities {
+            let refs: Vec<u8> = match entity {
+                Entity::ClockSource { .. } => Vec::new(),
+                Entity::ClockSelector { sources, .. }
+                | Entity::Selector { sources, .. }
+                | Entity::Mixer { sources, .. } => sources.clone(),
+                Entity::Processing {
+                    sources, clocks, ..
+                } => sources.iter().chain(clocks).copied().collect(),
+                Entity::ClockMultiplier { source, .. } | Entity::Feature { source, .. } => {
+                    vec![*source]
+                }
+                Entity::Input { clock, .. } => {
+                    if self.protocol == super::UAC1 {
+                        Vec::new()
+                    } else {
+                        vec![*clock]
+                    }
+                }
+                Entity::Output { source, clock, .. } => {
+                    if self.protocol == super::UAC1 {
+                        vec![*source]
+                    } else {
+                        vec![*source, *clock]
+                    }
+                }
+            };
+            for id in refs {
+                self.entity(id)?;
+            }
+            self.acyclic(entity.id(), &mut [false; 256], &mut [false; 256])?;
+        }
+        self.validate_mixers()
+    }
+    fn acyclic(
+        &self,
+        id: u8,
+        active: &mut [bool; 256],
+        done: &mut [bool; 256],
+    ) -> Result<(), Error> {
+        if active[usize::from(id)] {
+            return Err(Error::Descriptor("cyclic UAC2 graph"));
+        }
+        if done[usize::from(id)] {
+            return Ok(());
+        }
+        active[usize::from(id)] = true;
+        let sources: &[u8] = match self.entity(id)? {
+            Entity::ClockSelector { sources, .. }
+            | Entity::Selector { sources, .. }
+            | Entity::Mixer { sources, .. }
+            | Entity::Processing { sources, .. } => sources,
+            Entity::ClockMultiplier { source, .. }
+            | Entity::Feature { source, .. }
+            | Entity::Output { source, .. } => core::slice::from_ref(source),
+            _ => &[],
+        };
+        for source in sources {
+            self.acyclic(*source, active, done)?;
+        }
+        active[usize::from(id)] = false;
+        done[usize::from(id)] = true;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Sync {
+    Synchronous,
+    Adaptive,
+    Explicit(Endpoint),
+    Implicit {
+        interface: u8,
+        alternate: u8,
+        endpoint: Endpoint,
+        frame_bytes: usize,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Format {
+    /// UAC3 high-capability cluster ID; maps are held in Binding.
+    pub cluster_id: Option<u16>,
+    /// UAC3 power ownership, awakened before alternate selection and DMA.
+    pub power_domain: Option<super::PowerDomain>,
+    /// UAC1 endpoint-owned frequencies; UAC2 uses its real clock graph.
+    pub endpoint_rates: Option<super::EndpointRates>,
+    pub interface: u8,
+    pub alternate: u8,
+    pub terminal: u8,
+    pub clock: u8,
+    pub direction: Direction,
+    pub channels: u8,
+    pub subslot: u8,
+    pub bits: u8,
+    pub channel_config: u32,
+    pub data: Endpoint,
+    pub sync: Sync,
+    pub service_microframes: u32,
+    pub max_bytes: usize,
+    pub fill_max: bool,
+    /// wValue and wIndex of the SET_CUR that enables endpoint pitch control.
+    pub pitch: Option<(u16, u16)>,
+}
+impl Format {
+    /// Linux `snd_usb_init_pitch`, after the sample rate: `init_pitch_v1`
+    /// addresses the data endpoint, `init_pitch_v2` sends index 0 and UAC3
+    /// sends nothing. Nothing is read back.
+    pub(super) fn init_pitch<C: Control>(&self, io: &mut C) -> Result<(), Error> {
+        if let Some((value, index)) = self.pitch
+            && !io
+                .control(setup(0x22, 1, value, index, 1), &[1])?
+                .is_empty()
+        {
+            return Err(Error::ControlLength);
+        }
+        Ok(())
+    }
+    pub(super) fn endpoints(&self) -> Vec<Endpoint> {
+        let mut endpoints = vec![self.data];
+        if let Sync::Explicit(feedback) = self.sync {
+            endpoints.push(feedback);
+        }
+        endpoints
+    }
+    pub fn frame_bytes(&self) -> usize {
+        usize::from(self.channels) * usize::from(self.subslot)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Binding {
+    pub clusters: Vec<super::Cluster>,
+    pub entity_clusters: Vec<(u8, u16)>,
+    /// BADD declares fixed topology; other protocols discover their graph.
+    pub basic_profile: Option<super::BasicProfile>,
+    pub graph: Graph,
+    pub formats: Vec<Format>,
+    pub speed: u8,
+    /// Unsupported advertised alternates kept without hiding the reason.
+    pub unsupported: Vec<(u8, u8, &'static str)>,
+}
+
+fn controls(mut bits: u32, count: usize) -> Result<(), Error> {
+    for _ in 0..count {
+        if bits & 3 == 2 {
+            return Err(Error::Descriptor("reserved UAC2 control access"));
+        }
+        bits >>= 2;
+    }
+    Ok(())
+}
+
+fn graph(control: &Interface) -> Result<Graph, Error> {
+    let mut entities = Vec::new();
+    let mut header = false;
+    let mut total = 0usize;
+    let mut advertised = 0usize;
+    for d in &control.extra {
+        if d.len() < 3 || d[1] != CS_INTERFACE {
+            continue;
+        }
+        total += d.len();
+        let short = || Error::Descriptor("short/invalid UAC2 AC descriptor");
+        let entity = match d[2] {
+            1 => {
+                if header || d.len() != 9 || le16(d, 3) != 0x0200 {
+                    return Err(short());
+                }
+                header = true;
+                advertised = usize::from(le16(d, 6));
+                None
+            }
+            2 => {
+                if d.len() != 17 || d[8] == 0 {
+                    return Err(short());
+                }
+                Some(Entity::Input {
+                    id: d[3],
+                    terminal_type: le16(d, 4),
+                    clock: d[7],
+                    channels: d[8],
+                    channel_config: le32(d, 9),
+                })
+            }
+            3 => {
+                if d.len() != 12 {
+                    return Err(short());
+                }
+                Some(Entity::Output {
+                    id: d[3],
+                    terminal_type: le16(d, 4),
+                    source: d[7],
+                    clock: d[8],
+                })
+            }
+            4 => Some(super::mixer::parse(d, UAC2)?),
+            5 | 11 => {
+                if d.len() < 8 || d[4] == 0 || d.len() != usize::from(d[4]) + 7 {
+                    return Err(short());
+                }
+                let n = usize::from(d[4]);
+                controls(u32::from(d[5 + n]), 1)?;
+                if d[2] == 5 {
+                    Some(Entity::Selector {
+                        id: d[3],
+                        sources: d[5..5 + n].to_vec(),
+                        controls: d[5 + n],
+                    })
+                } else {
+                    Some(Entity::ClockSelector {
+                        id: d[3],
+                        sources: d[5..5 + n].to_vec(),
+                        controls: d[5 + n],
+                    })
+                }
+            }
+            6 => {
+                if d.len() < 10 || !(d.len() - 6).is_multiple_of(4) {
+                    return Err(short());
+                }
+                let values: Vec<u32> = d[5..d.len() - 1]
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| le32(b, 0))
+                    .collect();
+                for value in &values {
+                    controls(*value, 16)?;
+                }
+                Some(Entity::Feature {
+                    id: d[3],
+                    source: d[4],
+                    controls: values,
+                })
+            }
+            10 => {
+                if d.len() != 8 {
+                    return Err(short());
+                }
+                controls(u32::from(d[5]), 2)?;
+                Some(Entity::ClockSource {
+                    id: d[3],
+                    attributes: d[4],
+                    controls: d[5],
+                })
+            }
+            12 => {
+                if d.len() != 7 {
+                    return Err(short());
+                }
+                controls(u32::from(d[5]), 2)?;
+                Some(Entity::ClockMultiplier {
+                    id: d[3],
+                    source: d[4],
+                    controls: d[5],
+                })
+            }
+            7 => {
+                // bSourceID, then a four-byte control bitmap for the master
+                // channel and each channel, then iEffects.
+                if d.len() < 12 || !(d.len() - 8).is_multiple_of(4) {
+                    return Err(short());
+                }
+                Some(Entity::Processing {
+                    id: d[3],
+                    subtype: d[2],
+                    sources: vec![d[6]],
+                    clocks: Vec::new(),
+                    cluster: None,
+                    controls: d[7..d.len() - 1].iter().any(|byte| *byte != 0),
+                })
+            }
+            8 | 9 => Some(processing_unit(d, UAC2, d[2] == 9)?),
+            13 => {
+                // bSourceID, bCSourceInID, bCSourceOutID, iSRC.
+                if d.len() != 8 {
+                    return Err(short());
+                }
+                Some(Entity::Processing {
+                    id: d[3],
+                    subtype: d[2],
+                    sources: vec![d[4]],
+                    clocks: vec![d[5], d[6]],
+                    cluster: None,
+                    controls: false,
+                })
+            }
+            _ => return Err(Error::Unsupported("reserved UAC2 AC descriptor subtype")),
+        };
+        if let Some(entity) = entity {
+            if entity.id() == 0 || entities.iter().any(|e: &Entity| e.id() == entity.id()) {
+                return Err(Error::Descriptor("duplicate/zero UAC2 entity ID"));
+            }
+            entities.push(entity);
+        }
+    }
+    if !header || total != advertised || entities.is_empty() {
+        return Err(Error::Descriptor("UAC2 AC header total length"));
+    }
+    let graph = Graph {
+        protocol: UAC2,
+        control_interface: control.number,
+        entities,
+    };
+    graph.validate()?;
+    Ok(graph)
+}
+
+pub(super) fn scope(
+    configuration: &[u8],
+    control: u8,
+    all: &[Interface],
+    protocol: u8,
+) -> Result<core::ops::Range<u16>, Error> {
+    if configuration.len() < 9
+        || configuration[0] != 9
+        || configuration[1] != 2
+        || usize::from(le16(configuration, 2)) != configuration.len()
+    {
+        return Err(Error::Descriptor("incomplete USB configuration"));
+    }
+    let mut at = 0;
+    let mut settings = Vec::new();
+    let mut numbers = Vec::new();
+    let mut endpoint_count = 0usize;
+    let mut expected = None;
+    let mut addresses = Vec::new();
+    let mut association = None;
+    let mut associations: Vec<core::ops::Range<u16>> = Vec::new();
+    while at < configuration.len() {
+        if configuration.len() - at < 2 {
+            return Err(Error::Descriptor("truncated USB descriptor"));
+        }
+        let n = usize::from(configuration[at]);
+        if n < 2 || at + n > configuration.len() {
+            return Err(Error::Descriptor("USB descriptor length"));
+        }
+        let d = &configuration[at..at + n];
+        match d[1] {
+            INTERFACE_DESCRIPTOR => {
+                if n < 9
+                    || expected.is_some_and(|count| count != endpoint_count)
+                    || settings.contains(&(d[2], d[3]))
+                {
+                    return Err(Error::Descriptor(
+                        "invalid/duplicate audio interface extent",
+                    ));
+                }
+                settings.push((d[2], d[3]));
+                if !numbers.contains(&d[2]) {
+                    numbers.push(d[2]);
+                }
+                expected = Some(usize::from(d[4]));
+                endpoint_count = 0;
+                addresses.clear();
+            }
+            ENDPOINT_DESCRIPTOR => {
+                if n < 7 || expected.is_none() || addresses.contains(&d[2]) {
+                    return Err(Error::Descriptor("invalid audio endpoint extent/count"));
+                }
+                addresses.push(d[2]);
+                endpoint_count += 1;
+            }
+            _ => {}
+        }
+        if d[1] == INTERFACE_ASSOCIATION_DESCRIPTOR {
+            if n != 8 || d[3] == 0 {
+                return Err(Error::Descriptor("invalid interface association"));
+            }
+            let start = u16::from(d[2]);
+            let end = start + u16::from(d[3]);
+            if end > 256
+                || associations
+                    .iter()
+                    .any(|range| start < range.end && range.start < end)
+            {
+                return Err(Error::Descriptor(
+                    "overlapping/out-of-range interface associations",
+                ));
+            }
+            associations.push(start..end);
+            if start <= u16::from(control) && u16::from(control) < end {
+                if association.is_some()
+                    || d[4] != CLASS
+                    || d[6] != protocol
+                    || d[2] != control
+                    || end > 256
+                {
+                    return Err(Error::Descriptor(
+                        "ambiguous/non-UAC2 interface association",
+                    ));
+                }
+                association = Some(start..end);
+            }
+        }
+        at += n;
+    }
+    if expected.is_some_and(|count| count != endpoint_count)
+        || numbers.len() != usize::from(configuration[4])
+        || numbers
+            .iter()
+            .any(|number| !settings.contains(&(*number, 0)))
+    {
+        return Err(Error::Descriptor("audio interface/endpoint count mismatch"));
+    }
+    association
+        .or_else(|| {
+            (protocol == super::UAC1
+                || all
+                    .iter()
+                    .filter(|i| {
+                        i.alternate == 0 && i.class == CLASS && i.subclass == CONTROL_SUBCLASS
+                    })
+                    .count()
+                    == 1)
+                .then_some(0..256)
+        })
+        .ok_or(Error::Descriptor(
+            "multiple UAC2 functions require interface associations",
+        ))
+}
+
+fn format(
+    interface: &Interface,
+    graph: &Graph,
+    speed: u8,
+    all: &[Interface],
+) -> Result<Format, Error> {
+    let general: Vec<_> = interface
+        .extra
+        .iter()
+        .filter(|d| d.len() >= 3 && d[1] == CS_INTERFACE && d[2] == 1)
+        .collect();
+    let ty: Vec<_> = interface
+        .extra
+        .iter()
+        .filter(|d| d.len() >= 3 && d[1] == CS_INTERFACE && d[2] == 2)
+        .collect();
+    if general.len() != 1 || ty.len() != 1 || general[0].len() != 16 || ty[0].len() != 6 {
+        return Err(Error::Descriptor("UAC2 AS/format descriptor"));
+    }
+    let g = general[0];
+    let f = ty[0];
+    if g[5] != 1 || f[3] != 1 || le32(g, 6) & 1 == 0 {
+        return Err(Error::Unsupported("UAC2 non-Type-I signed PCM"));
+    }
+    if !(1..=32).contains(&g[10]) || !(1..=4).contains(&f[4]) || f[5] == 0 || f[5] > f[4] * 8 {
+        return Err(Error::Format);
+    }
+    let data: Vec<_> = interface
+        .endpoints
+        .iter()
+        .filter(|ep| ep.kind() == ISOCHRONOUS && ep.attributes & USAGE != FEEDBACK)
+        .copied()
+        .collect();
+    let feedback: Vec<_> = interface
+        .endpoints
+        .iter()
+        .filter(|ep| ep.kind() == ISOCHRONOUS && ep.attributes & USAGE == FEEDBACK)
+        .copied()
+        .collect();
+    if data.len() != 1
+        || feedback.len() > 1
+        || interface.endpoints.len() != data.len() + feedback.len()
+    {
+        return Err(Error::Descriptor("UAC2 data/feedback endpoint layout"));
+    }
+    let data = data[0];
+    let direction = if data.is_in() {
+        Direction::Capture
+    } else {
+        Direction::Playback
+    };
+    let max_bytes = capacity(data, speed)?;
+    let interval = service_interval(data, speed)?;
+    let clock = graph.terminal_clock(g[3], direction)?;
+    let sync = match ((data.attributes >> 2) & 3, direction) {
+        (3, _) => Sync::Synchronous,
+        (2, _) => Sync::Adaptive,
+        (1, Direction::Capture) => Sync::Synchronous,
+        (1, Direction::Playback) => {
+            if let Some(fb) = feedback.first().copied() {
+                if !fb.is_in() || capacity(fb, speed)? < if speed == HIGH_SPEED { 4 } else { 3 } {
+                    return Err(Error::Descriptor("UAC2 feedback endpoint"));
+                }
+                service_interval(fb, speed)?;
+                Sync::Explicit(fb)
+            } else {
+                // Linux's generic UAC2 implicit-feedback association is the
+                // immediately following AS interface at the same alternate,
+                // explicitly marked as implicit-feedback data (usage 2).
+                let source = all
+                    .iter()
+                    .find(|i| {
+                        u16::from(i.number) == u16::from(interface.number) + 1
+                            && i.alternate == interface.alternate
+                            && i.class == CLASS
+                            && i.subclass == STREAMING_SUBCLASS
+                            && i.protocol == UAC2
+                    })
+                    .ok_or(Error::Unsupported(
+                        "asynchronous playback has no feedback source",
+                    ))?;
+                let endpoint = source
+                    .endpoints
+                    .first()
+                    .copied()
+                    .filter(|e| {
+                        e.kind() == ISOCHRONOUS
+                            && e.is_in()
+                            && e.attributes & USAGE == IMPLICIT_FEEDBACK
+                    })
+                    .ok_or(Error::Unsupported(
+                        "adjacent AS interface is not implicit feedback",
+                    ))?;
+                let input = format(source, graph, speed, all)?;
+                if input.service_microframes != interval {
+                    return Err(Error::Unsupported(
+                        "implicit feedback service interval differs from playback",
+                    ));
+                }
+                Sync::Implicit {
+                    interface: source.number,
+                    alternate: source.alternate,
+                    endpoint,
+                    frame_bytes: input.frame_bytes(),
+                }
+            }
+        }
+        _ => return Err(Error::Unsupported("UAC2 endpoint synchronization type")),
+    };
+    if !matches!(sync, Sync::Explicit(_)) && !feedback.is_empty() {
+        return Err(Error::Descriptor("unexpected explicit feedback endpoint"));
+    }
+    let endpoint: Vec<_> = interface
+        .extra
+        .iter()
+        .filter(|d| d.len() >= 3 && d[1] == CS_ENDPOINT && d[2] == 1)
+        .collect();
+    if endpoint.len() != 1 || endpoint[0].len() != 8 {
+        return Err(Error::Descriptor("UAC2 class-specific data endpoint"));
+    }
+    let fill_max = endpoint[0][3] & 0x80 != 0;
+    // UAC2_CONTROL_PITCH in bmControls; UAC2_EP_CS_PITCH.
+    let pitch = (endpoint[0][4] & 3 != 0).then_some((1 << 8, 0));
+    Ok(Format {
+        cluster_id: None,
+        power_domain: None,
+        endpoint_rates: None,
+        interface: interface.number,
+        alternate: interface.alternate,
+        terminal: g[3],
+        clock,
+        direction,
+        channels: g[10],
+        subslot: f[4],
+        bits: f[5],
+        channel_config: le32(g, 11),
+        data,
+        sync,
+        service_microframes: interval,
+        max_bytes,
+        fill_max,
+        pitch,
+    })
+}
+
+pub(super) fn capacity(endpoint: Endpoint, speed: u8) -> Result<usize, Error> {
+    let packet = usize::from(endpoint.max_packet & 0x7ff);
+    let extra = (endpoint.max_packet >> 11) & 3;
+    if endpoint.kind() != ISOCHRONOUS
+        || endpoint.attributes & 0xc0 != 0
+        || endpoint.attributes & USAGE == USAGE
+        || endpoint.address & 0x70 != 0
+        || endpoint.address & 15 == 0
+        || packet == 0
+        || endpoint.companion.is_some()
+        || endpoint.max_packet & 0xe000 != 0
+    {
+        return Err(Error::Descriptor("invalid USB2 isochronous endpoint"));
+    }
+    match speed {
+        FULL_SPEED if packet <= 1023 && extra == 0 => Ok(packet),
+        HIGH_SPEED if packet <= 1024 && extra <= 2 => Ok(packet * (usize::from(extra) + 1)),
+        _ => Err(Error::Unsupported(
+            "USB audio requires full/high-speed isochronous transport",
+        )),
+    }
+}
+pub(super) fn service_interval(endpoint: Endpoint, speed: u8) -> Result<u32, Error> {
+    if !(1..=16).contains(&endpoint.interval) {
+        return Err(Error::Descriptor("invalid isochronous bInterval"));
+    }
+    match speed {
+        FULL_SPEED => Ok(8u32 << u32::from(endpoint.interval - 1)),
+        HIGH_SPEED => Ok(1u32 << u32::from(endpoint.interval - 1)),
+        _ => Err(Error::Unsupported("USB audio speed")),
+    }
+}
+
+impl Binding {
+    pub fn parse(
+        control: &Interface,
+        all: &[Interface],
+        configuration: &[u8],
+        speed: u8,
+    ) -> Result<Self, Error> {
+        if control.class == CLASS
+            && control.subclass == CONTROL_SUBCLASS
+            && control.protocol == super::UAC1
+            && control.alternate == 0
+        {
+            return super::uac1::binding(control, all, configuration, speed);
+        }
+        if control.class == CLASS
+            && control.subclass == CONTROL_SUBCLASS
+            && control.protocol == super::UAC3
+            && control.alternate == 0
+        {
+            return super::badd::binding(control, all, configuration, speed);
+        }
+        if control.class != CLASS
+            || control.subclass != CONTROL_SUBCLASS
+            || control.protocol != UAC2
+            || control.alternate != 0
+        {
+            return Err(Error::Unsupported(
+                "standard UAC2 control interface required",
+            ));
+        }
+        let scope = scope(configuration, control.number, all, UAC2)?;
+        let graph = graph(control)?;
+        let mut formats = Vec::new();
+        let mut unsupported: Vec<_> = unexposed_controls(&graph).into_iter().collect();
+        for interface in all.iter().filter(|i| {
+            scope.contains(&u16::from(i.number))
+                && i.class == CLASS
+                && i.subclass == STREAMING_SUBCLASS
+                && i.protocol == UAC2
+                && i.alternate != 0
+        }) {
+            if !all
+                .iter()
+                .any(|i| i.number == interface.number && i.alternate == 0 && i.endpoints.is_empty())
+            {
+                return Err(Error::Descriptor(
+                    "audio streaming interface has no zero-bandwidth alternate",
+                ));
+            }
+            match format(interface, &graph, speed, all) {
+                Ok(format) => formats.push(format),
+                Err(Error::Unsupported(reason)) => {
+                    unsupported.push((interface.number, interface.alternate, reason))
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if formats.is_empty() {
+            return Err(Error::Unsupported("no usable UAC2 PCM alternate"));
+        }
+        for (n, a) in formats.iter().enumerate() {
+            if formats[n + 1..]
+                .iter()
+                .any(|b| a.interface == b.interface && a.alternate == b.alternate)
+            {
+                return Err(Error::Descriptor("duplicate audio alternate"));
+            }
+        }
+        // Other class owners cannot coordinate future alternate changes with
+        // this audio owner. Do not claim any of their descriptor-advertised DCIs.
+        // In-function AS alternates may reuse endpoints; simultaneous
+        // playback/capture plans are checked again at start.
+        for format in &formats {
+            let endpoints = format.endpoints();
+            if all
+                .iter()
+                .filter(|i| i.number != format.interface)
+                .any(|i| {
+                    let owned_stream = scope.contains(&u16::from(i.number))
+                        && (i.class, i.subclass, i.protocol) == (CLASS, STREAMING_SUBCLASS, UAC2);
+                    !owned_stream
+                        && i.endpoints
+                            .iter()
+                            .any(|ep| endpoints.iter().any(|ours| ours.dci() == ep.dci()))
+                })
+            {
+                return Err(Error::Descriptor(
+                    "audio alternate aliases a foreign interface endpoint",
+                ));
+            }
+        }
+        Ok(Self {
+            clusters: Vec::new(),
+            entity_clusters: Vec::new(),
+            basic_profile: None,
+            graph,
+            formats,
+            speed,
+            unsupported,
+        })
+    }
+    pub(crate) fn settings(&self) -> Vec<(u8, u8)> {
+        let mut settings = vec![(self.graph.control_interface, 0)];
+        for f in &self.formats {
+            if !settings.iter().any(|(i, _)| *i == f.interface) {
+                settings.push((f.interface, 0));
+            }
+        }
+        settings
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests;

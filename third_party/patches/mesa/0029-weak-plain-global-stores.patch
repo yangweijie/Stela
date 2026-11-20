@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 19:09:11 +0000
+Subject: [PATCH] nak: emit weak global stores unless the store is coherent,
+ volatile or atomic
+
+A plain store has to reach another thread only through a barrier or
+fence: within a workgroup bar.sync orders it, and beyond the workgroup
+a release writes L1 back (CCTL.WBALL) before a GPU membar, which waits
+for weak stores as for strong ones. Between dispatches and towards the
+host, Vulkan barriers flush the shader caches (INVALIDATE_SHADER_CACHES
+with FLUSH_DATA). So strong GPU-scope order buys a plain store nothing.
+Coherent, volatile and atomic stores keep it; atomic RMWs and loads are
+not changed.
+---
+ src/nouveau/compiler/nak/from_nir.rs | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/src/nouveau/compiler/nak/from_nir.rs b/src/nouveau/compiler/nak/from_nir.rs
+index ee81dcabd501091180cca5f2331ec1be18216488..693a470e46fc29bdd96b6089509336f255de3be2 100644
+--- a/src/nouveau/compiler/nak/from_nir.rs
++++ b/src/nouveau/compiler/nak/from_nir.rs
+@@ -2199,6 +2199,23 @@ impl<'a> ShaderFromNir<'a> {
+         }
+     }
+ 
++    /// The order of a global store.
++    ///
++    /// Coherent, volatile and atomic stores are seen by other threads
++    /// without a barrier, so they stay strong at GPU scope. A plain store
++    /// only has to be seen by another thread through a barrier or fence:
++    /// within a workgroup bar.sync orders it, beyond the workgroup the
++    /// release writes L1 back before a GPU membar, and between dispatches
++    /// and towards the host the API's barriers flush the shader caches. So
++    /// it is weak.
++    fn global_order(&self, access: gl_access_qualifier) -> MemOrder {
++        if access & (ACCESS_COHERENT | ACCESS_VOLATILE | ACCESS_ATOMIC) != 0 {
++            MemOrder::Strong(MemScope::GPU)
++        } else {
++            MemOrder::Weak
++        }
++    }
++
+     fn get_image_dim(&mut self, intrin: &nir_intrinsic_instr) -> ImageDim {
+         let is_array = intrin.image_array();
+         let image_dim = intrin.image_dim();
+@@ -3874,10 +3891,11 @@ impl<'a> ShaderFromNir<'a> {
+                 let size_B =
+                     (srcs[0].bit_size() / 8) * srcs[0].num_components();
+                 assert!(u32::from(size_B) <= intrin.align());
++                let order = self.global_order(intrin.access());
+                 let access = MemAccess {
+                     mem_type: MemType::from_size(size_B, false),
+                     space: MemSpace::Global(MemAddrType::A64),
+-                    order: MemOrder::Strong(MemScope::GPU),
++                    order: order,
+                     eviction_priority: self
+                         .get_eviction_priority(intrin.access()),
+                 };

@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 19:08:58 +0000
+Subject: [PATCH] nak: order global memory within a workgroup with bar.sync and
+ a CTA membar
+
+The invocations of a workgroup share an SM and its L1, and bar.sync
+orders their global memory accesses as CUDA's __syncthreads() does. So a
+workgroup-scope barrier on global or SSBO memory takes MEMBAR.CTA and no
+cache control; only images keep MEMBAR.GPU there. Beyond the workgroup
+a release still writes L1 back and an acquire invalidates it, now for
+SSBO memory too.
+
+This keeps the code workgroup barriers had while nir_opt_barrier_modes
+dropped the modes of explicit accesses, which now stay.
+---
+ src/nouveau/compiler/nak/from_nir.rs | 30 ++++++++++++++++------------
+ 1 file changed, 17 insertions(+), 13 deletions(-)
+
+diff --git a/src/nouveau/compiler/nak/from_nir.rs b/src/nouveau/compiler/nak/from_nir.rs
+index 77c08534f6ad198955fdc68f9e06783f8467c059..ee81dcabd501091180cca5f2331ec1be18216488 100644
+--- a/src/nouveau/compiler/nak/from_nir.rs
++++ b/src/nouveau/compiler/nak/from_nir.rs
+@@ -3654,9 +3654,19 @@ impl<'a> ShaderFromNir<'a> {
+             nir_intrinsic_barrier => {
+                 let modes = intrin.memory_modes();
+                 let semantics = intrin.memory_semantics();
+-                if (modes & nir_var_mem_global) != 0
+-                    && (semantics & NIR_MEMORY_RELEASE) != 0
+-                {
++                // The invocations of a workgroup share an SM and its L1,
++                // and bar.sync orders their global memory accesses as
++                // CUDA's __syncthreads() does, so only an order beyond the
++                // workgroup writes L1 back on a release, invalidates it on
++                // an acquire and waits at GPU scope. SSBOs are global
++                // memory by now.
++                let global = nir_var_mem_global | nir_var_mem_ssbo;
++                let beyond_workgroup = matches!(
++                    intrin.memory_scope(),
++                    SCOPE_QUEUE_FAMILY | SCOPE_DEVICE
++                );
++                let cache_control = beyond_workgroup && (modes & global) != 0;
++                if cache_control && (semantics & NIR_MEMORY_RELEASE) != 0 {
+                     // Pre-Volta doesn't have WBAll but it also seems that we
+                     // don't need it.
+                     if self.sm.sm() >= 70 {
+@@ -3684,14 +3694,10 @@ impl<'a> ShaderFromNir<'a> {
+                     let mem_scope = match intrin.memory_scope() {
+                         SCOPE_INVOCATION | SCOPE_SUBGROUP => MemScope::CTA,
+                         // A membar.gpu is very expensive so use .cta whenever
+-                        // possible.
+-                        // TODO: Figure out under which conditions we can relax
+-                        //       them for global memory/images to CTA.
++                        // possible. Images may go through other caches than
++                        // L1, so they still take .gpu.
+                         SCOPE_WORKGROUP => {
+-                            let global_modes = nir_var_image
+-                                | nir_var_mem_global
+-                                | nir_var_mem_ssbo;
+-                            if intrin.memory_modes() & global_modes != 0 {
++                            if modes & nir_var_image != 0 {
+                                 MemScope::GPU
+                             } else {
+                                 MemScope::CTA
+@@ -3702,9 +3708,7 @@ impl<'a> ShaderFromNir<'a> {
+                     };
+                     b.push_op(OpMemBar { scope: mem_scope });
+                 }
+-                if (modes & nir_var_mem_global) != 0
+-                    && (semantics & NIR_MEMORY_ACQUIRE) != 0
+-                {
++                if cache_control && (semantics & NIR_MEMORY_ACQUIRE) != 0 {
+                     b.push_op(OpCCtl {
+                         op: CCtlOp::IVAll,
+                         mem_space: MemSpace::Global(MemAddrType::A64),

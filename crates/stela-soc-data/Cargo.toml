@@ -1,0 +1,27 @@
+[package]
+name = "stela-soc-data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Apple SoC topology, register geometry and initial image contracts"
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = ["std"]
+std = ["stela-contracts/std", "stela-formats/std"]
+test-support = ["stela-contracts/test-support"]
+
+[dependencies]
+stela-crypto = { path = "../stela-crypto" }
+stela-contracts = { path = "../stela-contracts", default-features = false }
+stela-formats = { path = "../stela-formats", default-features = false }
+
+[dev-dependencies]
+stela-contracts = { path = "../stela-contracts", default-features = false, features = ["test-support"] }
+sha2 = { version = "0.10", default-features = false }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }

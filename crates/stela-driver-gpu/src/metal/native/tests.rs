@@ -1,0 +1,405 @@
+use super::{CommandBuffers, InFlight, failure, forward, objects};
+use crate::metal::{
+    binding::HeapArray,
+    error::Error,
+    nvidia::{Chip, fixture::nvk},
+    vulkan::{
+        Format, ImageCreate, ImageTiling, ImageType, ImageUsage, MemoryProperties as M,
+        PrimitiveTopology, SampleCounts, ShaderStages,
+        backend::Descriptor,
+        object::{
+            BufferView, GraphicsPipelineInfo, ImageInfo, ImageView, LinearLayout, MemoryRequest,
+            Sampler, ShaderCode,
+        },
+    },
+};
+use alloc::{collections::VecDeque, vec, vec::Vec};
+use ash::vk::{self, Handle};
+
+mod lifecycle;
+mod submission;
+
+#[test]
+fn in_flight_retirement_observes_a_timeline_once_per_ready_run() {
+    let main = vk::Semaphore::from_raw(1);
+    let sparse_step = vk::Semaphore::from_raw(2);
+    let mut flights: VecDeque<_> = (1..=64)
+        .map(|value| InFlight {
+            timeline: main,
+            value,
+            buffers: CommandBuffers::One(vk::CommandBuffer::null()),
+        })
+        .collect();
+    flights.push_back(InFlight {
+        timeline: sparse_step,
+        value: 1,
+        buffers: CommandBuffers::One(vk::CommandBuffer::null()),
+    });
+    let mut queries = Vec::new();
+    assert_eq!(
+        InFlight::completed_prefix(&flights, |timeline| {
+            queries.push(timeline);
+            Ok(32)
+        }),
+        Ok(32),
+    );
+    assert_eq!(queries, [main], "stop at the first unfinished submission");
+
+    queries.clear();
+    assert_eq!(
+        InFlight::completed_prefix(&flights, |timeline| {
+            queries.push(timeline);
+            Ok(if timeline == main { 64 } else { 0 })
+        }),
+        Ok(64),
+    );
+    assert_eq!(queries, [main, sparse_step]);
+}
+
+/// A command buffer's part submitted ahead of a wait ends signaling a
+/// Metal event, whose semaphore the device destroys once that work
+/// completed: retirement must then not query it, as RADV's freed
+/// `vk_sync` faulted the host.
+#[test]
+fn in_flight_retirement_never_queries_a_destroyed_events_semaphore() {
+    let main = vk::Semaphore::from_raw(1);
+    let event = vk::Semaphore::from_raw(7);
+    let flight = |timeline, value| InFlight {
+        timeline,
+        value,
+        buffers: CommandBuffers::One(vk::CommandBuffer::null()),
+    };
+    let mut flights: VecDeque<_> = [flight(event, 5), flight(main, 1), flight(main, 2)].into();
+    InFlight::forget(&mut flights, event);
+    let mut queries = Vec::new();
+    assert_eq!(
+        InFlight::completed_prefix(&flights, |timeline| {
+            queries.push(timeline);
+            Ok(1)
+        }),
+        Ok(2),
+    );
+    assert_eq!(queries, [main], "the destroyed semaphore is not queried");
+}
+
+fn memory() -> crate::metal::vulkan::physical::Memory {
+    nvk(Chip::find(0x1b3).unwrap(), 16 << 30).memory
+}
+
+#[test]
+fn memory_candidates_put_preferred_types_first() {
+    let shared_cached = MemoryRequest {
+        required: M::HOST_VISIBLE | M::HOST_COHERENT,
+        preferred: M::HOST_CACHED,
+        mapped: true,
+    };
+    assert_eq!(
+        objects::memory_candidates(&memory(), u32::MAX, shared_cached),
+        [2, 1, 3]
+    );
+    let write_combined = MemoryRequest {
+        preferred: M::DEVICE_LOCAL,
+        ..shared_cached
+    };
+    assert_eq!(
+        objects::memory_candidates(&memory(), u32::MAX, write_combined),
+        [3, 1, 2]
+    );
+    // The resource's memory types restrict the candidates.
+    assert_eq!(
+        objects::memory_candidates(&memory(), 0b0010, write_combined),
+        [1]
+    );
+}
+
+#[test]
+fn mapped_requests_need_host_visible_memory() {
+    let private = MemoryRequest {
+        required: M::DEVICE_LOCAL,
+        preferred: M::EMPTY,
+        mapped: false,
+    };
+    assert_eq!(
+        objects::memory_candidates(&memory(), u32::MAX, private),
+        [0, 3]
+    );
+    let mapped = MemoryRequest {
+        mapped: true,
+        ..private
+    };
+    assert_eq!(objects::memory_candidates(&memory(), u32::MAX, mapped), [3]);
+}
+
+#[test]
+fn heap_bindings_follow_the_array_order() {
+    let bindings = objects::heap_bindings(&[10, 20, 30, 40, 50]);
+    let types = [
+        vk::DescriptorType::SAMPLED_IMAGE,
+        vk::DescriptorType::STORAGE_IMAGE,
+        vk::DescriptorType::SAMPLER,
+        vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+        vk::DescriptorType::STORAGE_TEXEL_BUFFER,
+    ];
+    for ((binding, ty), array) in bindings.iter().zip(types).zip(HeapArray::ALL) {
+        assert_eq!(binding.binding, array.raw());
+        assert!(binding.descriptor_type == ty);
+        assert_eq!(binding.descriptor_count, 10 * (array.raw() + 1));
+        assert!(binding.stage_flags == vk::ShaderStageFlags::ALL);
+    }
+}
+
+#[test]
+fn descriptors_write_their_array_slot() {
+    let set = vk::Handle::from_raw(7);
+    let mut written = None;
+    objects::descriptor_write(set, 9, Descriptor::StorageImage(ImageView(5)), |write| {
+        // SAFETY: the write points at one image info for this call.
+        let image = unsafe { *write.p_image_info };
+        written = Some((
+            write.dst_binding,
+            write.dst_array_element,
+            write.descriptor_type,
+            image.image_view,
+            image.image_layout,
+        ));
+    });
+    // ash's enums implement `Debug` only with its `debug` feature.
+    assert!(
+        written
+            == Some((
+                HeapArray::StorageImages.raw(),
+                9,
+                vk::DescriptorType::STORAGE_IMAGE,
+                vk::Handle::from_raw(5),
+                vk::ImageLayout::GENERAL,
+            ))
+    );
+
+    let mut sampler = None;
+    objects::descriptor_write(set, 0, Descriptor::Sampler(Sampler(3)), |write| {
+        // SAFETY: as above.
+        sampler = Some(unsafe { (*write.p_image_info).sampler });
+    });
+    assert_eq!(sampler, Some(vk::Handle::from_raw(3)));
+
+    let mut texel = None;
+    objects::descriptor_write(
+        set,
+        0,
+        Descriptor::UniformTexelBuffer(BufferView(0)),
+        |write| {
+            // SAFETY: the write points at one texel buffer view.
+            texel = Some((write.descriptor_type, unsafe { *write.p_texel_buffer_view }));
+        },
+    );
+    assert!(
+        texel
+            == Some((
+                vk::DescriptorType::UNIFORM_TEXEL_BUFFER,
+                vk::BufferView::null()
+            ))
+    );
+}
+
+#[test]
+fn linear_images_chain_an_explicit_linear_layout() {
+    let info = ImageInfo {
+        flags: ImageCreate::MUTABLE_FORMAT,
+        image_type: ImageType::D2,
+        format: Format::R8G8B8A8Unorm,
+        extent: [64, 32, 1],
+        mip_levels: 1,
+        array_layers: 1,
+        samples: SampleCounts::C1,
+        tiling: ImageTiling::DrmFormatModifier,
+        usage: ImageUsage::SAMPLED,
+        view_formats: vec![Format::R8G8B8A8Unorm, Format::R8G8B8A8Srgb],
+        linear: Some(LinearLayout { row_pitch: 256 }),
+    };
+    let chain = objects::image(&info, |create| {
+        assert!(create.tiling == vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT);
+        assert!(create.initial_layout == vk::ImageLayout::UNDEFINED);
+        let mut types = vec![];
+        let mut next = create.p_next.cast::<vk::BaseInStructure<'_>>();
+        while !next.is_null() {
+            // SAFETY: every link is a structure the builder chained.
+            let base = unsafe { &*next };
+            if base.s_type == vk::StructureType::IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT
+            {
+                // SAFETY: the type names the structure.
+                let explicit =
+                    unsafe { &*next.cast::<vk::ImageDrmFormatModifierExplicitCreateInfoEXT<'_>>() };
+                assert_eq!(explicit.drm_format_modifier, 0);
+                // SAFETY: one plane layout.
+                assert_eq!(unsafe { (*explicit.p_plane_layouts).row_pitch }, 256);
+            }
+            types.push(base.s_type);
+            next = base.p_next;
+        }
+        Ok(types)
+    })
+    .unwrap();
+    assert!(chain.contains(&vk::StructureType::IMAGE_FORMAT_LIST_CREATE_INFO));
+    assert!(chain.contains(&vk::StructureType::IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT));
+}
+
+fn pipeline(
+    stages: &[(ShaderStages, ShaderCode)],
+    topology: PrimitiveTopology,
+) -> GraphicsPipelineInfo {
+    GraphicsPipelineInfo {
+        stages: stages.to_vec(),
+        vertex_input: Default::default(),
+        topology,
+        patch_control_points: 1,
+        samples: SampleCounts::C4,
+        alpha_to_coverage: true,
+        alpha_to_one: false,
+        line_rasterization: Default::default(),
+        color_formats: vec![Some(Format::B8G8R8A8Unorm), None],
+        depth_format: Some(Format::D32Sfloat),
+        stencil_format: None,
+        color_blend: vec![],
+        dynamic_states: vec![],
+        source: Default::default(),
+        indirect_bindable: false,
+    }
+}
+
+#[test]
+fn mesh_pipelines_have_no_vertex_input() {
+    let layout = vk::PipelineLayout::null();
+    let code = ShaderCode(1);
+    let mesh = pipeline(
+        &[(ShaderStages::MESH, code), (ShaderStages::FRAGMENT, code)],
+        PrimitiveTopology::TriangleList,
+    );
+    objects::graphics_pipeline(&mesh, layout, |create| {
+        assert!(create.p_vertex_input_state.is_null());
+        assert!(create.p_input_assembly_state.is_null());
+        assert!(create.p_tessellation_state.is_null());
+        assert_eq!(create.stage_count, 2);
+        Ok(())
+    })
+    .unwrap();
+
+    let patches = pipeline(
+        &[
+            (ShaderStages::VERTEX, code),
+            (ShaderStages::TESSELLATION_CONTROL, code),
+        ],
+        PrimitiveTopology::PatchList,
+    );
+    objects::graphics_pipeline(&patches, layout, |create| {
+        assert!(!create.p_vertex_input_state.is_null());
+        assert!(!create.p_tessellation_state.is_null());
+        // SAFETY: the builder chained the rendering info first.
+        let rendering = unsafe { &*create.p_next.cast::<vk::PipelineRenderingCreateInfo<'_>>() };
+        assert_eq!(rendering.color_attachment_count, 2);
+        // SAFETY: two formats.
+        let second = unsafe { *rendering.p_color_attachment_formats.add(1) };
+        assert!(second == vk::Format::UNDEFINED);
+        assert!(rendering.depth_attachment_format == vk::Format::D32_SFLOAT);
+        // SAFETY: the stage array has two entries.
+        let stage = unsafe { &*create.p_stages };
+        // SAFETY: the stage's entry point is a live, NUL-terminated C string.
+        let entry = unsafe { core::ffi::CStr::from_ptr(stage.p_name) };
+        assert_eq!(entry, objects::ENTRY_POINT);
+        assert!(stage.module == vk::ShaderModule::null());
+        // SAFETY: the builder chained the stage's NIR.
+        let nir = unsafe { &*stage.p_next.cast::<objects::NirStage>() };
+        // SAFETY: every chained structure starts with its type.
+        let s_type = unsafe { *stage.p_next.cast::<vk::StructureType>() };
+        assert!(s_type == objects::NirStage::STRUCTURE_TYPE);
+        assert_eq!(nir.nir(), 1);
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn driver_messages_reach_the_loader_s_log() {
+    use core::sync::atomic::{AtomicBool, Ordering};
+    static HEARD: AtomicBool = AtomicBool::new(false);
+    fn log(message: &str) {
+        HEARD.store(message == "thrd_create failed", Ordering::SeqCst);
+    }
+    let data = vk::DebugUtilsMessengerCallbackDataEXT::default().message(c"thrd_create failed\n");
+    // SAFETY: the data and message outlive the call, and the user data is
+    // a `fn(&str)` as a messenger's is.
+    let answer = unsafe {
+        forward(
+            vk::DebugUtilsMessageSeverityFlagsEXT::ERROR,
+            vk::DebugUtilsMessageTypeFlagsEXT::GENERAL,
+            &data,
+            log as *mut core::ffi::c_void,
+        )
+    };
+    // The driver's call goes on, and the log heard the message without its
+    // line end.
+    assert_eq!(answer, vk::FALSE);
+    assert!(HEARD.load(Ordering::SeqCst));
+}
+
+#[test]
+fn vulkan_failures_map_to_metal_errors() {
+    assert_eq!(failure(vk::Result::ERROR_DEVICE_LOST), Error::DeviceLost);
+    assert_eq!(
+        failure(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY),
+        Error::OutOfMemory
+    );
+    assert_eq!(
+        failure(vk::Result::ERROR_FRAGMENTED_POOL),
+        Error::OutOfMemory
+    );
+    assert!(matches!(
+        failure(vk::Result::ERROR_INITIALIZATION_FAILED),
+        Error::Unsupported(_)
+    ));
+    // A refusal names the driver's result.
+    let Error::Unsupported(reason) = failure(vk::Result::ERROR_UNKNOWN) else {
+        panic!("an unknown driver failure is unsupported");
+    };
+    assert!(reason.contains("VK_ERROR_UNKNOWN"));
+    // A result with no name of its own keeps its raw value.
+    assert_eq!(
+        failure(vk::Result::ERROR_EXTENSION_NOT_PRESENT),
+        Error::Driver(vk::Result::ERROR_EXTENSION_NOT_PRESENT.as_raw())
+    );
+}
+
+#[test]
+fn a_small_bar_is_noted_and_a_full_one_is_not() {
+    use crate::metal::vulkan::{
+        MemoryHeapFlags,
+        physical::{Memory, MemoryHeap, MemoryType},
+    };
+    let heap = |size| MemoryHeap {
+        size,
+        flags: MemoryHeapFlags::DEVICE_LOCAL,
+        budget: None,
+    };
+    let kind = |properties, heap_index| MemoryType {
+        properties,
+        heap_index,
+    };
+    let vram = 16u64 << 30;
+    // NVK puts the window the CPU reaches in a heap of its own.
+    let windowed = Memory {
+        heaps: vec![heap(vram), heap(256 << 20)],
+        types: vec![
+            kind(M::DEVICE_LOCAL, 0),
+            kind(M::DEVICE_LOCAL | M::HOST_VISIBLE | M::HOST_COHERENT, 1),
+        ],
+    };
+    let note = super::small_bar(&windowed).unwrap();
+    assert!(note.contains("256 MiB of 16384 MiB"), "{note}");
+    let full = Memory {
+        heaps: vec![heap(vram)],
+        types: vec![
+            kind(M::DEVICE_LOCAL, 0),
+            kind(M::DEVICE_LOCAL | M::HOST_VISIBLE | M::HOST_COHERENT, 0),
+        ],
+    };
+    assert_eq!(super::small_bar(&full), None);
+}

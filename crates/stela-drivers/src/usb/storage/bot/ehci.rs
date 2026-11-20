@@ -1,0 +1,276 @@
+//! Bulk-Only Transport over an EHCI controller's high-speed bulk pipes. The
+//! controller runs one transfer at a time through its own bounce buffer, so
+//! each stage copies through it and completes before the next begins.
+use super::{Bot, Buffer, COMMAND_US, Io, TransportBuffer, quirks};
+use crate::{
+    Clock,
+    block::BlockError,
+    usb::{
+        descriptor::{Endpoint, Interface, interfaces},
+        ehci::{self, host},
+        xhci::STALL,
+    },
+};
+use alloc::{string::String, vec::Vec};
+
+/// The wait between looks at a transfer in flight; each look stops the
+/// controller's schedule.
+const POLL_US: u64 = 250;
+
+/// An EHCI controller's failure as the storage layer reports it: a STALL
+/// in the completion code BOT clears halts on, anything else a failure its
+/// reset recovery answers.
+pub(in crate::usb) fn block(error: ehci::Error) -> BlockError {
+    match error {
+        ehci::Error::Device(_) if error.stalled() => BlockError::Device { status: STALL },
+        ehci::Error::Device(_) => BlockError::Protocol("EHCI transaction error"),
+        ehci::Error::Timeout => BlockError::Timeout,
+        ehci::Error::Minimum(error) => BlockError::PciPower(error),
+        ehci::Error::Config(error) => BlockError::Config(error),
+        ehci::Error::Mapping(error) => BlockError::Mmio(error),
+        ehci::Error::Irq(error) => BlockError::Irq(error),
+        ehci::Error::Unsupported(why) => BlockError::Unsupported(why),
+        ehci::Error::Stale | ehci::Error::Removed => {
+            BlockError::Unsupported("EHCI device no longer attached")
+        }
+        ehci::Error::Quarantined => BlockError::Unsupported("EHCI controller quarantined"),
+        ehci::Error::Preparation(_) => BlockError::Protocol("EHCI requester preparation failed"),
+        ehci::Error::Busy => BlockError::Protocol("EHCI transfer while another is in flight"),
+        ehci::Error::Memory(_) | ehci::Error::Exhausted => BlockError::NoDmaMemory,
+        ehci::Error::Dma(_) => BlockError::Protocol("EHCI DMA mapping failure"),
+        ehci::Error::Invalid | ehci::Error::Register | ehci::Error::Clock => {
+            BlockError::Protocol("EHCI controller refused the request")
+        }
+    }
+}
+
+/// A Bulk-Only interface's pipes on an EHCI root device.
+pub(in crate::usb) struct EhciBulk {
+    controller: host::Shared,
+    device: ehci::DeviceId,
+    pipes: Vec<ehci::BulkPipe>,
+    clock: Clock,
+    descriptor: [u8; 18],
+}
+
+impl EhciBulk {
+    pub(in crate::usb) fn new(
+        controller: host::Shared,
+        device: ehci::DeviceId,
+        pipes: Vec<ehci::BulkPipe>,
+        clock: Clock,
+        descriptor: [u8; 18],
+    ) -> Self {
+        Self {
+            controller,
+            device,
+            pipes,
+            clock,
+            descriptor,
+        }
+    }
+    fn pipe(&self, endpoint: Endpoint) -> Result<ehci::BulkPipe, BlockError> {
+        self.pipes
+            .iter()
+            .find(|pipe| pipe.endpoint_address() == endpoint.address)
+            .cloned()
+            .ok_or(BlockError::Unsupported(
+                "BOT endpoint outside the EHCI configuration",
+            ))
+    }
+}
+
+impl Io for EhciBulk {
+    type Buffer = Vec<u8>;
+
+    /// The root reset and rebind needs no new DMA: the controller keeps one
+    /// arena for every transfer.
+    fn reset_device(
+        bot: &mut Bot<Self>,
+        _dma: &mut dyn crate::bus::dma::DmaAllocator,
+    ) -> Option<Result<Bot<Self>, (String, BlockError)>> {
+        Some(bot.reset_and_rebind_ehci())
+    }
+
+    fn ready(&mut self) -> Result<(), BlockError> {
+        self.controller
+            .borrow()
+            .validate(&self.device)
+            .map_err(block)
+    }
+    fn control(&mut self, request: [u8; 8]) -> Result<Vec<u8>, BlockError> {
+        let mut controller = self.controller.borrow_mut();
+        if request[0] & 0x80 != 0 {
+            controller.control_in(&self.device, request)
+        } else {
+            controller
+                .control_out(&self.device, request, &[])
+                .map(|()| Vec::new())
+        }
+        .map_err(block)
+    }
+    fn clear(&mut self, endpoint: Endpoint) -> Result<(), BlockError> {
+        let pipe = self.pipe(endpoint)?;
+        self.controller
+            .borrow_mut()
+            .clear_halt(&pipe)
+            .map_err(block)
+    }
+    fn bulk(
+        &mut self,
+        endpoint: Endpoint,
+        buffer: &mut Vec<u8>,
+        length: usize,
+    ) -> Result<usize, BlockError> {
+        let pipe = self.pipe(endpoint)?;
+        let mut controller = self.controller.borrow_mut();
+        let ticket = if endpoint.is_in() {
+            controller.submit_bulk_in(&pipe, length, COMMAND_US)
+        } else {
+            controller.submit_bulk_out(&pipe, &buffer.bytes()[..length], COMMAND_US)
+        }
+        .map_err(block)?;
+        loop {
+            if let Some(done) = controller.poll(&ticket).map_err(block)? {
+                if endpoint.is_in() {
+                    buffer.bytes_mut()[..done.actual].copy_from_slice(&done.data[..done.actual]);
+                }
+                return Ok(done.actual);
+            }
+            self.clock.delay(POLL_US);
+        }
+    }
+    fn delay(&self, micros: u64) {
+        self.clock.delay(micros);
+    }
+    fn minimum_wait(&mut self, micros: u64) -> Result<(), BlockError> {
+        self.controller
+            .borrow_mut()
+            .wait_minimum(micros)
+            .map_err(block)
+    }
+    fn now_us(&self) -> u64 {
+        self.clock.now_us()
+    }
+    /// Disable the device's root: PE0 isolates it before its address can
+    /// serve another device.
+    fn quarantine(&mut self) {
+        let _ = self.controller.borrow_mut().disable_port(&self.device);
+    }
+}
+
+impl Bot<EhciBulk> {
+    /// A Bulk-Only interface of a configured high-speed EHCI device.
+    pub(in crate::usb) fn ehci(mut io: EhciBulk, setting: &Interface) -> Result<Self, BlockError> {
+        let flags = quirks::Flags::high_speed(&io.descriptor).map_err(BlockError::Unsupported)?;
+        let endpoints = endpoints(setting)?;
+        // EHCI copies through its controller-owned DMA arena. BOT's command,
+        // status and payload staging stay in CPU memory for this transport.
+        let staging = |bytes| -> Result<_, BlockError> {
+            let mut buffer = Vec::new();
+            buffer
+                .try_reserve_exact(bytes)
+                .map_err(|_| BlockError::Unsupported("EHCI BOT CPU staging memory exhausted"))?;
+            buffer.resize(bytes, 0);
+            Ok(TransportBuffer::new(buffer))
+        };
+        let buffer = staging(super::MAX_TD)?;
+        let wrapper = staging(64)?;
+        let max_lun = Self::startup(&mut io, setting.number, flags)?;
+        Ok(Self::with_buffers(
+            io,
+            setting.number,
+            endpoints,
+            buffer,
+            wrapper,
+            flags,
+            max_lun,
+        ))
+    }
+
+    /// Linux `usb_reset_device` for a root device: reset its port, address
+    /// and configure it afresh, check it is the same device and keep the
+    /// two transport allocations, as [`Bot::reset_and_rebind`] does on xHCI.
+    #[expect(
+        clippy::result_large_err,
+        reason = "The shared error preserves exact source and cleanup causes without allocating on propagation."
+    )]
+    pub(in crate::usb) fn reset_and_rebind_ehci(&mut self) -> Result<Self, (String, BlockError)> {
+        self.poisoned = true;
+        let fail = |why| {
+            (
+                String::from("BOT reset/rebind"),
+                BlockError::Unsupported(why),
+            )
+        };
+        if !self.buffer.present() || !self.wrapper.present() {
+            return Err(fail("BOT transport buffers already transferred"));
+        }
+        let controller = self.io.controller.clone();
+        let failed = |operation: &str, error: ehci::Error| (String::from(operation), block(error));
+        let hub = if self.io.device.is_root() {
+            None
+        } else {
+            controller
+                .borrow()
+                .hub_port_of(&self.io.device)
+                .map_err(|e| failed("BOT reset find hub port", e))?
+        };
+        let addressed = host::readdress(&controller, &self.io.device)
+            .map_err(|e| failed("BOT reset port", e))?;
+        let id = addressed.id.clone();
+        let result = (|| {
+            if addressed.descriptor != self.io.descriptor {
+                return Err(fail("USB device identity/descriptors changed across reset"));
+            }
+            let pipes = {
+                let mut c = controller.borrow_mut();
+                let configuration = host::configuration(&mut c, &id, 0)
+                    .map_err(|e| failed("BOT reset read configuration", e))?;
+                if !interfaces(&configuration)
+                    .iter()
+                    .any(|i| i.number == self.interface && super::super::bulk_only(i))
+                {
+                    return Err(fail("USB reset lost the BOT interface"));
+                }
+                c.configure(&id, 0)
+                    .map_err(|e| failed("BOT reset restore configuration", e))?
+            };
+            let flags = quirks::Flags::high_speed(&addressed.descriptor).map_err(fail)?;
+            let mut io = EhciBulk::new(
+                controller.clone(),
+                id.clone(),
+                pipes,
+                self.io.clock,
+                addressed.descriptor,
+            );
+            let max_lun = Self::startup(&mut io, self.interface, flags)
+                .map_err(|e| (String::from("BOT reset reconstruct transport"), e))?;
+            // Every fallible step is done and the old device's handles were
+            // retired by the reset; move the unique buffer owners.
+            Ok(self.moved_to(io, self.interface, flags, max_lun))
+        })();
+        if result.is_err() {
+            let _ = match &hub {
+                None => controller.borrow_mut().disable_port(&id),
+                Some((hub, port)) => controller.borrow_mut().disable_hub_port(hub, *port),
+            };
+        }
+        result
+    }
+}
+
+/// The interface's bulk IN and OUT endpoints, in BOT's order.
+fn endpoints(setting: &Interface) -> Result<[Endpoint; 2], BlockError> {
+    let bulk = |input: bool| {
+        setting
+            .endpoints
+            .iter()
+            .copied()
+            .find(|e| e.kind() == 2 && e.is_in() == input)
+            .ok_or(BlockError::Unsupported(
+                "Bulk-Only interface without bulk IN and OUT endpoints",
+            ))
+    };
+    Ok([bulk(true)?, bulk(false)?])
+}

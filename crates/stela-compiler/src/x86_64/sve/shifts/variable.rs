@@ -1,0 +1,282 @@
+//! Per-lane variable shifts by unsigned counts.
+use super::repeated_constant;
+use crate::x86_64::asm::Gpr::Rax;
+use crate::x86_64::asm::{Code, Rm};
+use crate::x86_64::simd::shifts::{
+    byte_shift, logical_shift as shared_logical_shift, right_shift as shared_right_shift,
+};
+use crate::{
+    TargetCpu,
+    aarch64::{
+        scalable::ElementSize,
+        sve::shifts::{Count, Kind},
+    },
+    x86_64::isa::{ShiftOpcode as Shift, SimdOpcode as Host, VexShiftOpcode},
+};
+
+/// Only complete unsigned per-element counts map directly. Wide counts,
+/// signed bidirectional/rounded shifts and narrower lanes keep their own
+/// recipes. The target-independent DIT profile gate remains conservative.
+pub(super) fn avx2_opcode(
+    kind: Kind,
+    element: ElementSize,
+    count: Count,
+    target: TargetCpu,
+) -> Option<VexShiftOpcode> {
+    if !target.supports(TargetCpu::Avx2) || !matches!(count, Count::Elements(_)) {
+        return None;
+    }
+    match (kind, element) {
+        (Kind::LogicalLeft, ElementSize::Word) => Some(VexShiftOpcode::LeftDword),
+        (Kind::LogicalRight, ElementSize::Word) => Some(VexShiftOpcode::RightDword),
+        (Kind::ArithmeticRight, ElementSize::Word) => Some(VexShiftOpcode::ArithmeticDword),
+        (Kind::LogicalLeft, ElementSize::Doubleword) => Some(VexShiftOpcode::LeftQword),
+        (Kind::LogicalRight, ElementSize::Doubleword) => Some(VexShiftOpcode::RightQword),
+        _ => None,
+    }
+}
+const ADJACENT_DWORDS: u8 = 0xb1;
+const HIGH_DWORD_SIGN: u8 = 0xf5;
+const DWORD_SIGN_SHIFT: u8 = u32::BITS as u8 - 1;
+const WORD_SIGN_SHIFT: u8 = u16::BITS as u8 - 1;
+fn packed(code: &mut Code, opcode: Host, destination: u8, source: u8) {
+    opcode.register(code, destination, source, TargetCpu::Baseline);
+}
+/// Byte logical masks use one repeated qword constant, avoiding two-limb
+/// setup, unless GFNI shifts the bytes directly. Either clobbers XMM5 and RAX.
+fn logical_shift(code: &mut Code, xmm: u8, lane: u8, amount: u8, left: bool, target: TargetCpu) {
+    if lane != 1 {
+        shared_logical_shift(code, xmm, lane, amount, left, target);
+        return;
+    }
+    if amount == 0 || byte_shift(code, xmm, amount, left, false, Rax, target) {
+        return;
+    }
+    let opcode = if left {
+        Shift::LeftWord
+    } else {
+        Shift::RightWord
+    };
+    opcode.emit(code, xmm, amount);
+    let mask = if left {
+        (u16::from(u8::MAX) << amount) & u16::from(u8::MAX)
+    } else {
+        u16::from(u8::MAX) >> amount
+    };
+    repeated_constant(code, 5, ElementSize::Byte, u64::from(mask));
+    packed(code, Host::And, xmm, 5);
+}
+/// Arithmetic word shifts independently sign-extend each even and odd byte,
+/// unless GFNI shifts the bytes directly. XMM4, XMM5 and RAX are scratch;
+/// XMM1, XMM2 and old merge XMM6 survive unchanged.
+fn right_shift(code: &mut Code, xmm: u8, lane: u8, amount: u8, signed: bool, target: TargetCpu) {
+    if !signed {
+        logical_shift(code, xmm, lane, amount, false, target);
+        return;
+    }
+    if lane != 1 {
+        shared_right_shift(code, xmm, lane, amount, signed, target);
+        return;
+    }
+    if amount == 0 || byte_shift(code, xmm, amount, false, true, Rax, target) {
+        return;
+    }
+    const BYTE_BITS: u8 = u8::BITS as u8;
+    packed(code, Host::MoveAligned, 4, xmm);
+    Shift::LeftWord.emit(code, xmm, BYTE_BITS);
+    Shift::ArithmeticWord.emit(code, xmm, BYTE_BITS + amount);
+    Shift::LeftWord.emit(code, xmm, BYTE_BITS);
+    Shift::RightWord.emit(code, xmm, BYTE_BITS);
+    Shift::ArithmeticWord.emit(code, 4, amount);
+    Shift::RightWord.emit(code, 4, BYTE_BITS);
+    Shift::LeftWord.emit(code, 4, BYTE_BITS);
+    packed(code, Host::Or, xmm, 4);
+}
+fn equal_zero(code: &mut Code, xmm: u8, element: ElementSize) {
+    packed(code, Host::Xor, 4, 4);
+    let op = match element {
+        ElementSize::Byte => Host::EqualByte,
+        ElementSize::Halfword => Host::EqualWord,
+        ElementSize::Word | ElementSize::Doubleword => Host::EqualDword,
+        _ => unreachable!(),
+    };
+    packed(code, op, xmm, 4);
+    if element == ElementSize::Doubleword {
+        code.asm().simd_imm(
+            Host::ShuffleDword,
+            5,
+            Rm::Xmm(xmm),
+            ADJACENT_DWORDS,
+            TargetCpu::Baseline,
+        );
+        packed(code, Host::And, xmm, 5);
+    }
+}
+fn sign_mask(code: &mut Code, element: ElementSize) {
+    if element == ElementSize::Byte {
+        packed(code, Host::Xor, 3, 3);
+        packed(code, Host::GreaterByte, 3, 0);
+        return;
+    }
+    packed(code, Host::MoveAligned, 3, 0);
+    match element {
+        ElementSize::Halfword => Shift::ArithmeticWord.emit(code, 3, WORD_SIGN_SHIFT),
+        ElementSize::Word => Shift::ArithmeticDword.emit(code, 3, DWORD_SIGN_SHIFT),
+        ElementSize::Doubleword => {
+            Shift::ArithmeticDword.emit(code, 3, DWORD_SIGN_SHIFT);
+            code.asm().simd_imm(
+                Host::ShuffleDword,
+                3,
+                Rm::Xmm(3),
+                HIGH_DWORD_SIGN,
+                TargetCpu::Baseline,
+            );
+        }
+        _ => unreachable!(),
+    }
+}
+pub(super) fn chunk(code: &mut Code, kind: Kind, element: ElementSize, target: TargetCpu) {
+    assert!(matches!(
+        kind,
+        Kind::LogicalLeft | Kind::LogicalRight | Kind::ArithmeticRight
+    ));
+    let bits = element.bits();
+    let lane = element.bytes() as u8;
+    let mut amount = 1;
+    while amount < bits {
+        packed(code, Host::MoveAligned, 2, 1);
+        let count_bit = amount.trailing_zeros() as u8;
+        let shift = bits as u8 - 1 - count_bit;
+        match element {
+            ElementSize::Byte => {
+                Shift::LeftWord.emit(code, 2, shift);
+                packed(code, Host::Xor, 4, 4);
+                packed(code, Host::GreaterByte, 4, 2);
+                packed(code, Host::MoveAligned, 2, 4);
+            }
+            ElementSize::Halfword => {
+                Shift::LeftWord.emit(code, 2, shift);
+                Shift::ArithmeticWord.emit(code, 2, WORD_SIGN_SHIFT);
+            }
+            ElementSize::Word => {
+                Shift::LeftDword.emit(code, 2, shift);
+                Shift::ArithmeticDword.emit(code, 2, DWORD_SIGN_SHIFT);
+            }
+            ElementSize::Doubleword => {
+                Shift::LeftQword.emit(code, 2, shift);
+                Shift::ArithmeticDword.emit(code, 2, DWORD_SIGN_SHIFT);
+                code.asm().simd_imm(
+                    Host::ShuffleDword,
+                    2,
+                    Rm::Xmm(2),
+                    HIGH_DWORD_SIGN,
+                    TargetCpu::Baseline,
+                );
+            }
+            _ => unreachable!(),
+        }
+        packed(code, Host::MoveAligned, 3, 0);
+        if kind == Kind::ArithmeticRight {
+            right_shift(code, 3, lane, amount as u8, true, target);
+        } else {
+            logical_shift(
+                code,
+                3,
+                lane,
+                amount as u8,
+                kind == Kind::LogicalLeft,
+                target,
+            );
+        }
+        packed(code, Host::Xor, 3, 0);
+        packed(code, Host::And, 3, 2);
+        packed(code, Host::Xor, 0, 3);
+        amount *= 2;
+    }
+    packed(code, Host::MoveAligned, 2, 1);
+    if element == ElementSize::Byte {
+        repeated_constant(code, 5, element, u64::from(u8::MAX) ^ (bits as u64 - 1));
+        packed(code, Host::And, 2, 5);
+    } else {
+        logical_shift(code, 2, lane, bits.trailing_zeros() as u8, false, target);
+    }
+    equal_zero(code, 2, element);
+    if kind == Kind::ArithmeticRight {
+        sign_mask(code, element);
+        packed(code, Host::Xor, 3, 0);
+        packed(code, Host::AndNot, 2, 3);
+        packed(code, Host::Xor, 0, 2);
+    } else {
+        packed(code, Host::And, 0, 2);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn avx2_route_excludes_different_count_semantics_and_missing_widths() {
+        for (kind, element, count, target) in [
+            (
+                Kind::LogicalLeft,
+                ElementSize::Word,
+                Count::Elements(1),
+                TargetCpu::Baseline,
+            ),
+            (
+                Kind::LogicalLeft,
+                ElementSize::Word,
+                Count::Doublewords(1),
+                TargetCpu::Avx2,
+            ),
+            (
+                Kind::LogicalLeft,
+                ElementSize::Word,
+                Count::Immediate(1),
+                TargetCpu::Avx2,
+            ),
+            (
+                Kind::LogicalLeft,
+                ElementSize::Byte,
+                Count::Elements(1),
+                TargetCpu::Avx2,
+            ),
+            (
+                Kind::LogicalRight,
+                ElementSize::Halfword,
+                Count::Elements(1),
+                TargetCpu::Avx2,
+            ),
+            (
+                Kind::ArithmeticRight,
+                ElementSize::Doubleword,
+                Count::Elements(1),
+                TargetCpu::Avx2,
+            ),
+            (
+                Kind::RoundingSigned,
+                ElementSize::Word,
+                Count::Elements(1),
+                TargetCpu::Avx2,
+            ),
+            (
+                Kind::SaturatingUnsigned,
+                ElementSize::Word,
+                Count::Elements(1),
+                TargetCpu::Avx2,
+            ),
+        ] {
+            assert_eq!(avx2_opcode(kind, element, count, target), None);
+        }
+        assert_eq!(
+            avx2_opcode(
+                Kind::ArithmeticRight,
+                ElementSize::Word,
+                Count::Elements(1),
+                TargetCpu::Avx2
+            ),
+            Some(VexShiftOpcode::ArithmeticDword),
+        );
+    }
+}

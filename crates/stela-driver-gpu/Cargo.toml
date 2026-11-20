@@ -1,0 +1,53 @@
+[package]
+name = "stela-driver-gpu"
+links = "stela_driver_gpu"
+version.workspace = true
+edition.workspace = true
+# Stela's own code is GPL-2.0-or-later; Linux-derived ports retain their GPL
+# notices, Mesa, NVIDIA and Intel sources their MIT notices, and the LLVM
+# patches keep the terms of the upstream files they change.
+license = "GPL-2.0-or-later AND GPL-2.0-only AND MIT AND BSD-3-Clause AND Apache-2.0 WITH LLVM-exception"
+description = "PC GPU discovery, the nouveau port and Stela's Metal device"
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+# Common native Linux kernel services; selecting this attaches no GPU.
+linux-kernel = ["dep:cc", "dep:stela-c-build", "stela-c-build/linux", "dep:stela-linux", "stela-linux/kernel"]
+# nouveau's hardware resource manager (NVKM), compiled unchanged; it reaches
+# no device until the kernel services it imports are supplied.
+nouveau-port = ["linux-kernel", "stela-c-build/linux-registry"]
+# The Intel Xe driver's Kbuild composite, compiled unchanged; it reaches no
+# device until the kernel services it imports are supplied.
+xe-port = ["linux-kernel", "stela-c-build/linux-registry"]
+# Stela's Metal device over the internal Vulkan boundary; no Vulkan driver.
+metal = ["dep:stela-contracts"]
+# The Metal device's native backend over a loaded Vulkan driver (NVK).
+metal-vulkan = ["metal", "dep:ash"]
+# The image links the Metal compiler's C (`crates/stela-mesa`).
+metal-linked = ["metal-vulkan"]
+
+[dependencies]
+stela-linux = { path = "../stela-linux", optional = true }
+stela-driver-base = { path = "../stela-driver-base" }
+stela-driver-core = { path = "../stela-driver-core" }
+stela-crypto = { path = "../stela-crypto" }
+# The call gate contract the Metal service is entered through.
+stela-contracts = { path = "../stela-contracts", default-features = false, optional = true }
+# Vulkan bindings for the Metal device's native backend; no loader is linked.
+ash = { version = "0.38", default-features = false, optional = true }
+triomphe = { version = "=0.1.16", default-features = false }
+
+[dev-dependencies]
+stela-driver-base = { path = "../stela-driver-base", features = ["test-support"] }
+sha2 = { version = "0.10", default-features = false }
+
+[build-dependencies]
+# GPU composite imports are checked against their actual archive members.
+object = { version = "0.37", default-features = false, features = ["read"] }
+cc = { version = "1", optional = true }
+stela-c-build = { path = "../stela-c-build", optional = true }

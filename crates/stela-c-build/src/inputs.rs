@@ -1,0 +1,906 @@
+// SPDX-License-Identifier: GPL-2.0-or-later
+//! Bounded descriptor-relative build inputs, shared by source selection and
+//! original-object registration capture. No compiler or source is executed.
+//! Resolve explicitly selected root aliases once; never follow links below.
+//! Final rechecks refuse observed changes, not atomic cross-file/ABA snapshots.
+use sha2::{Digest, Sha256};
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    io::Read,
+    path::{Component, Path, PathBuf},
+};
+
+pub type Hash = [u8; 32];
+pub type Result<T> = std::result::Result<T, String>;
+macro_rules! require { ($condition:expr, $($message:tt)*) => { if !$condition { return Err(format!($($message)*)); } }; }
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct RootId(usize);
+impl RootId {
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub struct Key(usize);
+impl Key {
+    pub fn index(self) -> usize {
+        self.0
+    }
+}
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    pub max_unique_files: usize,
+    pub max_unique_bytes: u64,
+    pub max_roots: usize,
+}
+pub struct Request<'a> {
+    pub root: RootId,
+    pub relative: &'a Path,
+    pub expected_sha256: Option<Hash>,
+    pub max_bytes: u64,
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Identity {
+    pub device: i128,
+    pub inode: u128,
+    pub mode: u64,
+    pub bytes: u64,
+    pub mtime_secs: i128,
+    pub mtime_nanos: i128,
+    pub ctime_secs: i128,
+    pub ctime_nanos: i128,
+}
+impl Identity {
+    fn same_object(&self, other: &Self) -> bool {
+        self.device == other.device && self.inode == other.inode
+    }
+}
+#[derive(Clone, Debug)]
+pub struct Binding {
+    pub key: Key,
+    pub path: PathBuf,
+    pub bytes: u64,
+    pub sha256: Hash,
+    pub identity: Identity,
+}
+#[derive(Clone, Debug)]
+pub struct RootBinding {
+    pub root: RootId,
+    pub path: PathBuf,
+    pub identity: Identity,
+}
+#[derive(Clone, Debug, Default)]
+pub struct Stats {
+    pub unique_files: usize,
+    pub unique_bytes: u64,
+    pub bytes_hashed: u64,
+    pub bytes_returned: u64,
+    pub metadata_cache_hits: u64,
+}
+#[derive(Debug)]
+pub struct Bindings {
+    pub files: Vec<Binding>,
+    pub roots: Vec<RootBinding>,
+    pub stats: Stats,
+}
+#[derive(Clone)]
+struct Record {
+    root: RootId,
+    relative: PathBuf,
+    path: PathBuf,
+    expected: Option<Hash>,
+    max_bytes: u64,
+    observed: Option<Binding>,
+}
+
+/// A logical path is validated without resolving below-root symlinks or '..'.
+/// Per-component opens later enforce the corresponding filesystem boundary.
+pub fn validate_relative(path: &Path) -> Result<()> {
+    require!(
+        !path.as_os_str().is_empty() && !path.is_absolute(),
+        "expected nonempty relative input path"
+    );
+    require!(
+        path.as_os_str().len() <= 16 * 1024,
+        "relative input path exceeds finite bound"
+    );
+    for component in path.components() {
+        require!(
+            matches!(component, Component::Normal(_)),
+            "noncanonical relative input path: {}",
+            path.display()
+        );
+    }
+    #[cfg(windows)]
+    require!(
+        path.to_str().is_some_and(|text| !text.contains(':')),
+        "invalid relative input components"
+    );
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        require!(
+            path.as_os_str()
+                .as_bytes()
+                .split(|byte| *byte == b'/')
+                .all(|part| !part.is_empty()
+                    && part != b"."
+                    && part != b".."
+                    && !part.contains(&0)),
+            "invalid relative input components"
+        );
+    }
+    Ok(())
+}
+
+/// The bytes of `input`, at most `limit`: their count, digest and, when
+/// `retain` is set, the bytes themselves.
+fn stream(input: &mut File, limit: u64, retain: bool) -> Result<(u64, Hash, Option<Vec<u8>>)> {
+    let mut digest = Sha256::new();
+    let mut bytes = retain.then(Vec::new);
+    let mut size = 0u64;
+    let mut buffer = [0u8; 64 * 1024];
+    loop {
+        let remaining = limit
+            .checked_add(1)
+            .and_then(|bound| bound.checked_sub(size))
+            .ok_or("input limit overflow")?;
+        let count =
+            usize::try_from(remaining.min(u64::try_from(buffer.len()).map_err(|e| e.to_string())?))
+                .map_err(|e| e.to_string())?;
+        let read = input
+            .read(&mut buffer[..count])
+            .map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        size = size
+            .checked_add(u64::try_from(read).map_err(|e| e.to_string())?)
+            .ok_or("input size overflow")?;
+        require!(size <= limit, "input grew beyond byte bound");
+        digest.update(&buffer[..read]);
+        if let Some(bytes) = &mut bytes {
+            bytes.try_reserve(read).map_err(|error| error.to_string())?;
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+    }
+    Ok((size, digest.finalize().into(), bytes))
+}
+
+pub struct Inputs {
+    limits: Limits,
+    roots: Vec<platform::Root>,
+    records: Vec<Record>,
+    paths: BTreeMap<PathBuf, Key>,
+    stats: Stats,
+}
+impl Inputs {
+    pub fn new(limits: Limits) -> Result<Self> {
+        require!(
+            platform::SUPPORTED,
+            "safe build inputs require no-follow operations this host lacks"
+        );
+        require!(
+            limits.max_unique_files > 0
+                && limits.max_unique_bytes > 0
+                && limits.max_unique_bytes < u64::MAX
+                && limits.max_roots > 0,
+            "nonzero finite input limits required"
+        );
+        Ok(Self {
+            limits,
+            roots: Vec::new(),
+            records: Vec::new(),
+            paths: BTreeMap::new(),
+            stats: Stats::default(),
+        })
+    }
+    pub fn add_root(&mut self, selected: &Path) -> Result<RootId> {
+        let root = platform::Root::new(selected)?;
+        if let Some(index) = self.roots.iter().position(|known| known.path == root.path) {
+            require!(
+                self.roots[index].identity.same_object(&root.identity),
+                "selected root identity changed"
+            );
+            return Ok(RootId(index));
+        }
+        require!(
+            self.roots.len() < self.limits.max_roots,
+            "input root count exceeds bound"
+        );
+        let id = RootId(self.roots.len());
+        self.roots.push(root);
+        Ok(id)
+    }
+    fn root(&self, root: RootId) -> Result<&platform::Root> {
+        self.roots
+            .get(root.0)
+            .ok_or_else(|| "unknown input root".to_owned())
+    }
+    pub fn root_path(&self, root: RootId) -> Result<&Path> {
+        Ok(&self.root(root)?.path)
+    }
+    /// Preflight all intended uses before content access. Same absolute lexical
+    /// path shares one record, one expected pin and the tightest role cap.
+    /// Return request-order keys including duplicates. Errors commit nothing.
+    pub fn prepare(&mut self, requests: &[Request<'_>]) -> Result<Vec<Key>> {
+        let mut records = self.records.clone();
+        let mut paths = self.paths.clone();
+        let mut keys = Vec::new();
+        for request in requests {
+            validate_relative(request.relative)?;
+            require!(
+                request.max_bytes > 0 && request.max_bytes <= self.limits.max_unique_bytes,
+                "invalid per-role input cap"
+            );
+            let path = self.root(request.root)?.path.join(request.relative);
+            let key = if let Some(key) = paths.get(&path).copied() {
+                let record = &mut records[key.0];
+                if let (Some(old), Some(new)) = (record.expected, request.expected_sha256) {
+                    require!(
+                        old == new,
+                        "conflicting expected hashes for {}",
+                        path.display()
+                    );
+                }
+                if let Some(expected) = request.expected_sha256 {
+                    if let Some(observed) = &record.observed {
+                        require!(
+                            observed.sha256 == expected,
+                            "late expected hash conflicts with captured input"
+                        );
+                    }
+                    record.expected = Some(expected);
+                }
+                record.max_bytes = record.max_bytes.min(request.max_bytes);
+                if let Some(observed) = &record.observed {
+                    require!(
+                        observed.bytes <= record.max_bytes,
+                        "captured input exceeds tightened role cap"
+                    );
+                }
+                key
+            } else {
+                require!(
+                    records.len() < self.limits.max_unique_files,
+                    "unique prepared input count exceeds bound"
+                );
+                let key = Key(records.len());
+                paths.insert(path.clone(), key);
+                records.push(Record {
+                    root: request.root,
+                    relative: request.relative.to_owned(),
+                    path,
+                    expected: request.expected_sha256,
+                    max_bytes: request.max_bytes,
+                    observed: None,
+                });
+                key
+            };
+            keys.push(key);
+        }
+        self.records = records;
+        self.paths = paths;
+        Ok(keys)
+    }
+    fn capture(&mut self, key: Key, bytes: bool) -> Result<(Binding, Option<Vec<u8>>)> {
+        self.capture_with(key, bytes, &mut |_| Ok(()))
+    }
+    fn capture_with(
+        &mut self,
+        key: Key,
+        bytes: bool,
+        hook: &mut impl FnMut(platform::Step) -> Result<()>,
+    ) -> Result<(Binding, Option<Vec<u8>>)> {
+        let record = self
+            .records
+            .get(key.0)
+            .cloned()
+            .ok_or_else(|| "unprepared input key".to_owned())?;
+        let cached = record.observed.as_ref();
+        let hash = bytes || cached.is_none();
+        let cap = if cached.is_none() {
+            record.max_bytes.min(
+                self.limits
+                    .max_unique_bytes
+                    .saturating_sub(self.stats.unique_bytes),
+            )
+        } else {
+            record.max_bytes
+        };
+        let captured = self
+            .root(record.root)?
+            .capture(&record.relative, cap, hash, bytes, hook)?;
+        if let Some(previous) = cached {
+            require!(
+                previous.identity == captured.identity,
+                "input identity changed: {}",
+                record.path.display()
+            );
+        }
+        if let Some(digest) = captured.sha256 {
+            if let Some(expected) = record.expected {
+                require!(
+                    digest == expected,
+                    "input hash mismatch: {}",
+                    record.path.display()
+                );
+            }
+            if let Some(previous) = cached {
+                require!(
+                    digest == previous.sha256,
+                    "input bytes changed: {}",
+                    record.path.display()
+                );
+            }
+            self.stats.bytes_hashed = self
+                .stats
+                .bytes_hashed
+                .checked_add(captured.identity.bytes)
+                .ok_or("hash byte counter exhausted")?;
+        } else {
+            self.stats.metadata_cache_hits = self
+                .stats
+                .metadata_cache_hits
+                .checked_add(1)
+                .ok_or("input cache counter exhausted")?;
+        }
+        let digest = captured
+            .sha256
+            .or_else(|| cached.map(|value| value.sha256))
+            .ok_or("missing input digest")?;
+        let binding = Binding {
+            key,
+            path: record.path,
+            bytes: captured.identity.bytes,
+            sha256: digest,
+            identity: captured.identity,
+        };
+        if cached.is_none() {
+            self.stats.unique_bytes = self
+                .stats
+                .unique_bytes
+                .checked_add(binding.bytes)
+                .ok_or("unique byte counter exhausted")?;
+            self.stats.unique_files += 1;
+            self.records[key.0].observed = Some(binding.clone());
+        }
+        if let Some(value) = &captured.bytes {
+            self.stats.bytes_returned = self
+                .stats
+                .bytes_returned
+                .checked_add(u64::try_from(value.len()).map_err(|e| e.to_string())?)
+                .ok_or("returned byte counter exhausted")?;
+        }
+        Ok((binding, captured.bytes))
+    }
+    /// Hash-only first use. Repeats reopen safely and check identity/cap without
+    /// copying or rehashing a compiler/common header for every translation unit.
+    pub fn verify(&mut self, key: Key) -> Result<Binding> {
+        Ok(self.capture(key, false)?.0)
+    }
+    /// Temporary bytes for a parser/object scanner; not kept here.
+    pub fn read(&mut self, key: Key) -> Result<Vec<u8>> {
+        self.capture(key, true)?
+            .1
+            .ok_or_else(|| "missing captured bytes".to_owned())
+    }
+    /// Fresh streamed hash once per unique observed file, all roots
+    /// rechecked. Consuming closes reader-owned descriptors on success or error.
+    pub fn finish(mut self) -> Result<Bindings> {
+        for root in &self.roots {
+            root.check()?;
+        }
+        let mut files = Vec::new();
+        for record in &self.records {
+            let Some(binding) = &record.observed else {
+                continue;
+            };
+            let captured = self.root(record.root)?.capture(
+                &record.relative,
+                record.max_bytes,
+                true,
+                false,
+                &mut |_| Ok(()),
+            )?;
+            require!(
+                captured.identity == binding.identity && captured.sha256 == Some(binding.sha256),
+                "input changed before publication: {}",
+                record.path.display()
+            );
+            self.stats.bytes_hashed = self
+                .stats
+                .bytes_hashed
+                .checked_add(binding.bytes)
+                .ok_or("hash byte counter exhausted")?;
+            files.push(binding.clone());
+        }
+        for root in &self.roots {
+            root.check()?;
+        }
+        let roots = self
+            .roots
+            .iter()
+            .enumerate()
+            .map(|(index, root)| RootBinding {
+                root: RootId(index),
+                path: root.path.clone(),
+                identity: root.identity.clone(),
+            })
+            .collect();
+        Ok(Bindings {
+            files,
+            roots,
+            stats: self.stats,
+        })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod platform {
+    use super::*;
+    use std::{
+        ffi::{CString, OsStr},
+        io,
+        mem::MaybeUninit,
+        os::{
+            fd::{AsRawFd, FromRawFd, RawFd},
+            unix::ffi::OsStrExt,
+        },
+    };
+    pub(super) const SUPPORTED: bool = true;
+    const DIRECTORY: i32 =
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
+    const INPUT: i32 =
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY;
+    fn os<T>(value: io::Result<T>) -> Result<T> {
+        value.map_err(|error| error.to_string())
+    }
+    fn convert(value: &libc::stat) -> Result<Identity> {
+        Ok(Identity {
+            device: i128::from(value.st_dev),
+            inode: u128::from(value.st_ino),
+            mode: u64::from(value.st_mode),
+            bytes: u64::try_from(value.st_size).map_err(|_| "negative input size")?,
+            mtime_secs: i128::from(value.st_mtime),
+            mtime_nanos: i128::from(value.st_mtime_nsec),
+            ctime_secs: i128::from(value.st_ctime),
+            ctime_nanos: i128::from(value.st_ctime_nsec),
+        })
+    }
+    pub(super) fn identity(file: &File) -> Result<Identity> {
+        let mut value = MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: live File owns fd; exact stat output storage is writable.
+        let status = unsafe { libc::fstat(file.as_raw_fd(), value.as_mut_ptr()) };
+        require!(
+            status == 0,
+            "descriptor stat: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: successful fstat initialized all stat fields used by convert.
+        convert(unsafe { value.assume_init_ref() })
+    }
+    fn directory_mode(value: &Identity) -> bool {
+        value.mode & u64::from(libc::S_IFMT) == u64::from(libc::S_IFDIR)
+    }
+    fn regular(value: &Identity) -> bool {
+        value.mode & u64::from(libc::S_IFMT) == u64::from(libc::S_IFREG)
+    }
+    fn component(value: &OsStr) -> Result<CString> {
+        CString::new(value.as_bytes()).map_err(|error| format!("invalid input component: {error}"))
+    }
+    fn open_at(parent: RawFd, name: &OsStr, flags: i32) -> Result<File> {
+        let name = component(name)?;
+        // SAFETY: live parent, terminated name, no creation vararg.
+        let fd = unsafe { libc::openat(parent, name.as_ptr(), flags) };
+        require!(
+            fd >= 0,
+            "no-follow open {:?}: {}",
+            name,
+            io::Error::last_os_error()
+        );
+        // SAFETY: successful openat uniquely transfers descriptor ownership.
+        Ok(unsafe { File::from_raw_fd(fd) })
+    }
+    fn absolute(path: &Path) -> Result<File> {
+        require!(path.is_absolute(), "input root must be absolute");
+        // SAFETY: terminated literal and no O_CREAT vararg.
+        let fd = unsafe { libc::open(c"/".as_ptr(), DIRECTORY) };
+        require!(
+            fd >= 0,
+            "filesystem root open: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: successful open produced exactly this owned descriptor.
+        let mut parent = unsafe { File::from_raw_fd(fd) };
+        for part in path.components() {
+            match part {
+                Component::RootDir => {}
+                Component::Normal(name) => parent = open_at(parent.as_raw_fd(), name, DIRECTORY)?,
+                _ => return Err("noncanonical absolute root".into()),
+            }
+        }
+        Ok(parent)
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum Step {
+        BeforeDirectory(usize),
+        BeforeFinalOpen,
+        BeforeRead,
+        AfterRead,
+    }
+    pub(super) struct Capture {
+        pub identity: Identity,
+        pub sha256: Option<Hash>,
+        pub bytes: Option<Vec<u8>>,
+    }
+    pub(super) struct Root {
+        pub path: PathBuf,
+        pub identity: Identity,
+        directory: File,
+    }
+    impl Root {
+        pub fn new(selected: &Path) -> Result<Self> {
+            let path = os(selected.canonicalize())?;
+            let directory = absolute(&path)?;
+            let identity = identity(&directory)?;
+            require!(
+                directory_mode(&identity),
+                "selected root is not a directory"
+            );
+            Ok(Self {
+                path,
+                identity,
+                directory,
+            })
+        }
+        pub fn check(&self) -> Result<()> {
+            let current = absolute(&self.path)?;
+            require!(
+                self.identity.same_object(&identity(&current)?),
+                "selected input root changed"
+            );
+            Ok(())
+        }
+        fn walk(
+            &self,
+            path: Option<&Path>,
+            hook: &mut impl FnMut(Step) -> Result<()>,
+        ) -> Result<File> {
+            let mut parent = os(self.directory.try_clone())?;
+            if let Some(path) = path {
+                validate_relative(path)?;
+                for (index, part) in path.components().enumerate() {
+                    hook(Step::BeforeDirectory(index))?;
+                    let Component::Normal(part) = part else {
+                        return Err("invalid input directory component".into());
+                    };
+                    parent = open_at(parent.as_raw_fd(), part, DIRECTORY)?;
+                }
+            }
+            Ok(parent)
+        }
+        pub fn capture(
+            &self,
+            relative: &Path,
+            limit: u64,
+            hash: bool,
+            retain: bool,
+            hook: &mut impl FnMut(Step) -> Result<()>,
+        ) -> Result<Capture> {
+            validate_relative(relative)?;
+            let parent_path = relative
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty());
+            let parent = self.walk(parent_path, hook)?;
+            let name = relative.file_name().ok_or("input filename missing")?;
+            let encoded = component(name)?;
+            let mut metadata = MaybeUninit::<libc::stat>::uninit();
+            // SAFETY: live parent, terminated name, writable stat storage.
+            let status = unsafe {
+                libc::fstatat(
+                    parent.as_raw_fd(),
+                    encoded.as_ptr(),
+                    metadata.as_mut_ptr(),
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            require!(
+                status == 0,
+                "no-follow input stat {}: {}",
+                relative.display(),
+                io::Error::last_os_error()
+            );
+            // SAFETY: successful fstatat initialized stat fields used below.
+            let before_path = convert(unsafe { metadata.assume_init_ref() })?;
+            require!(
+                regular(&before_path) && before_path.bytes <= limit,
+                "nonregular/symlink/oversized input: {}",
+                relative.display()
+            );
+            hook(Step::BeforeFinalOpen)?;
+            let mut input = open_at(parent.as_raw_fd(), name, INPUT)?;
+            let before = identity(&input)?;
+            require!(
+                regular(&before) && before == before_path,
+                "input changed during safe open: {}",
+                relative.display()
+            );
+            if !hash {
+                return Ok(Capture {
+                    identity: before,
+                    sha256: None,
+                    bytes: None,
+                });
+            }
+            hook(Step::BeforeRead)?;
+            let (size, sha256, bytes) = stream(&mut input, limit, retain)?;
+            hook(Step::AfterRead)?;
+            let after = identity(&input)?;
+            require!(
+                before == after && size == before.bytes,
+                "input changed during bounded capture"
+            );
+            Ok(Capture {
+                identity: after,
+                sha256: Some(sha256),
+                bytes,
+            })
+        }
+    }
+}
+
+#[cfg(windows)]
+mod platform {
+    use super::*;
+    use std::{
+        ffi::OsStr,
+        fs::OpenOptions,
+        io,
+        mem::MaybeUninit,
+        os::windows::{fs::OpenOptionsExt, io::AsRawHandle},
+    };
+    pub(super) const SUPPORTED: bool = true;
+    /// Holding a directory open without delete sharing pins its name, which
+    /// gives the walk what a descriptor-relative open gives it on Unix.
+    const SHARE_READ_WRITE: u32 = 1 | 2;
+    const BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    const ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    /// Windows times count this many units in a second, and 100 ns in each.
+    const TICKS_PER_SECOND: u64 = 10_000_000;
+    #[repr(C)]
+    struct Time {
+        low: u32,
+        high: u32,
+    }
+    impl Time {
+        fn split(&self) -> (i128, i128) {
+            let ticks = u64::from(self.high) << 32 | u64::from(self.low);
+            (
+                i128::from(ticks / TICKS_PER_SECOND),
+                i128::from(ticks % TICKS_PER_SECOND) * 100,
+            )
+        }
+    }
+    #[repr(C)]
+    struct Information {
+        attributes: u32,
+        creation: Time,
+        access: Time,
+        write: Time,
+        volume: u32,
+        size_high: u32,
+        size_low: u32,
+        links: u32,
+        index_high: u32,
+        index_low: u32,
+    }
+    unsafe extern "system" {
+        fn GetFileInformationByHandle(file: *mut core::ffi::c_void, out: *mut Information) -> i32;
+    }
+    pub(super) fn identity(file: &File) -> Result<Identity> {
+        let mut value = MaybeUninit::<Information>::uninit();
+        // SAFETY: live File owns the handle; the output storage is writable.
+        let status =
+            unsafe { GetFileInformationByHandle(file.as_raw_handle(), value.as_mut_ptr()) };
+        require!(
+            status != 0,
+            "handle information: {}",
+            io::Error::last_os_error()
+        );
+        // SAFETY: a successful call initialized the whole structure.
+        let value = unsafe { value.assume_init() };
+        let (mtime_secs, mtime_nanos) = value.write.split();
+        let (ctime_secs, ctime_nanos) = value.creation.split();
+        Ok(Identity {
+            device: i128::from(value.volume),
+            inode: u128::from(value.index_high) << 32 | u128::from(value.index_low),
+            mode: u64::from(value.attributes),
+            bytes: u64::from(value.size_high) << 32 | u64::from(value.size_low),
+            mtime_secs,
+            mtime_nanos,
+            ctime_secs,
+            ctime_nanos,
+        })
+    }
+    fn plain(value: &Identity) -> bool {
+        value.mode & u64::from(ATTRIBUTE_REPARSE_POINT) == 0
+    }
+    fn directory_mode(value: &Identity) -> bool {
+        value.mode & u64::from(ATTRIBUTE_DIRECTORY) != 0 && plain(value)
+    }
+    fn regular(value: &Identity) -> bool {
+        value.mode & u64::from(ATTRIBUTE_DIRECTORY) == 0 && plain(value)
+    }
+    /// The object at `path` itself, a reparse point or not.
+    fn open(path: &Path) -> Result<File> {
+        os(OpenOptions::new()
+            .read(true)
+            .share_mode(SHARE_READ_WRITE)
+            .custom_flags(BACKUP_SEMANTICS | OPEN_REPARSE_POINT)
+            .open(path))
+        .map_err(|error| format!("no-follow open {}: {error}", path.display()))
+    }
+    fn os<T>(value: io::Result<T>) -> Result<T> {
+        value.map_err(|error| error.to_string())
+    }
+    fn open_directory(path: &Path) -> Result<File> {
+        let directory = open(path)?;
+        require!(
+            directory_mode(&identity(&directory)?),
+            "not a plain directory: {}",
+            path.display()
+        );
+        Ok(directory)
+    }
+    /// Each directory of `path` opened without following, held to the end.
+    fn absolute(path: &Path) -> Result<Vec<File>> {
+        let mut prefix = PathBuf::new();
+        let mut held = Vec::new();
+        for part in path.components() {
+            prefix.push(part);
+            if matches!(part, Component::Normal(_)) {
+                held.push(open_directory(&prefix)?);
+            }
+        }
+        Ok(held)
+    }
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    pub(super) enum Step {
+        BeforeDirectory(usize),
+        BeforeFinalOpen,
+        BeforeRead,
+        AfterRead,
+    }
+    pub(super) struct Capture {
+        pub identity: Identity,
+        pub sha256: Option<Hash>,
+        pub bytes: Option<Vec<u8>>,
+    }
+    pub(super) struct Root {
+        pub path: PathBuf,
+        pub identity: Identity,
+        _held: Vec<File>,
+    }
+    impl Root {
+        pub fn new(selected: &Path) -> Result<Self> {
+            let path = os(selected.canonicalize())?;
+            // Sources are joined with `/`, which a verbatim path takes literally.
+            let path = path
+                .to_str()
+                .and_then(|path| path.strip_prefix(r"\\?\"))
+                .map_or(path.clone(), PathBuf::from);
+            let held = absolute(&path)?;
+            let identity = identity(held.last().ok_or("input root has no directory")?)?;
+            Ok(Self {
+                path,
+                identity,
+                _held: held,
+            })
+        }
+        pub fn check(&self) -> Result<()> {
+            let held = absolute(&self.path)?;
+            let current = held.last().ok_or("input root has no directory")?;
+            require!(
+                self.identity.same_object(&identity(current)?),
+                "selected input root changed"
+            );
+            Ok(())
+        }
+        pub fn capture(
+            &self,
+            relative: &Path,
+            limit: u64,
+            hash: bool,
+            retain: bool,
+            hook: &mut impl FnMut(Step) -> Result<()>,
+        ) -> Result<Capture> {
+            validate_relative(relative)?;
+            let mut at = self.path.clone();
+            let mut held = Vec::new();
+            let parent = relative
+                .parent()
+                .filter(|path| !path.as_os_str().is_empty());
+            for (index, part) in parent.iter().flat_map(|path| path.components()).enumerate() {
+                hook(Step::BeforeDirectory(index))?;
+                let Component::Normal(part) = part else {
+                    return Err("invalid input directory component".into());
+                };
+                at.push::<&OsStr>(part);
+                held.push(open_directory(&at)?);
+            }
+            at.push(relative.file_name().ok_or("input filename missing")?);
+            hook(Step::BeforeFinalOpen)?;
+            let mut input = open(&at)?;
+            let before = identity(&input)?;
+            require!(
+                regular(&before) && before.bytes <= limit,
+                "nonregular/symlink/oversized input: {}",
+                relative.display()
+            );
+            if !hash {
+                return Ok(Capture {
+                    identity: before,
+                    sha256: None,
+                    bytes: None,
+                });
+            }
+            hook(Step::BeforeRead)?;
+            let (size, sha256, bytes) = stream(&mut input, limit, retain)?;
+            hook(Step::AfterRead)?;
+            let after = identity(&input)?;
+            require!(
+                before == after && size == before.bytes,
+                "input changed during bounded capture"
+            );
+            Ok(Capture {
+                identity: after,
+                sha256: Some(sha256),
+                bytes,
+            })
+        }
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+mod platform {
+    use super::*;
+    pub(super) const SUPPORTED: bool = false;
+    pub(super) struct Root {
+        pub path: PathBuf,
+        pub identity: Identity,
+    }
+    pub(super) enum Step {}
+    pub(super) struct Capture {
+        pub identity: Identity,
+        pub sha256: Option<Hash>,
+        pub bytes: Option<Vec<u8>>,
+    }
+    fn unsupported<T>() -> Result<T> {
+        Err("safe no-follow input operations unsupported on this host".into())
+    }
+    impl Root {
+        pub fn new(_: &Path) -> Result<Self> {
+            unsupported()
+        }
+        pub fn check(&self) -> Result<()> {
+            unsupported()
+        }
+        pub fn capture(
+            &self,
+            _: &Path,
+            _: u64,
+            _: bool,
+            _: bool,
+            _: &mut impl FnMut(Step) -> Result<()>,
+        ) -> Result<Capture> {
+            unsupported()
+        }
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
+mod tests;

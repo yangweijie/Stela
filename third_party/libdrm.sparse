@@ -1,0 +1,7 @@
+# The libdrm and amdgpu API headers Mesa's AMD and Intel support code includes; no
+# library sources.
+/*.h
+/include/drm/
+/amdgpu/*.h
+# The xe UAPI headers the ANV driver includes.
+/xe/*.h

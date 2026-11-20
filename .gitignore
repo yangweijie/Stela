@@ -1,0 +1,14 @@
+/target/
+/crates/*/target/
+/*.rcgu.o
+/.stela/
+/.tools
+*.ipsw
+*.dmg
+*.part
+*.part.json
+.DS_Store
+/GOAL.md
+/docs/
+/AGENTS.md
+/librust_out.rmeta

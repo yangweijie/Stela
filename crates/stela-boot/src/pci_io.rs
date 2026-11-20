@@ -1,0 +1,757 @@
+//! Firmware-only PCI_IO observation. This supplies no native hardware grant.
+//! Provenance: UEFI 2.11 chapter14, sections14.4.1/.8/.16/.18.
+//! https://uefi.org/specs/UEFI/2.11/14_Protocols_PCI_Bus_Support.html
+//! All callbacks and returned pool storage must end before ExitBootServices.
+use alloc::vec::Vec;
+use core::{
+    ffi::c_void,
+    mem::{offset_of, size_of},
+    ops::Range,
+    ptr::{self, NonNull},
+};
+use uefi::{
+    Handle, Status,
+    boot::{self, OpenProtocolAttributes, OpenProtocolParams, ScopedProtocol},
+    proto::{
+        ProtocolPointer, console::gop::GraphicsOutput, device_path::DevicePath, unsafe_protocol,
+    },
+};
+
+// Unused slots are opaque pointer-sized fields, never invoked. They preserve
+// the protocol's exact EFI_PCI_IO_PROTOCOL_ACCESS pairs and vtable ordering.
+type Read = unsafe extern "efiapi" fn(*mut PciIo, u32, u32, usize, *mut c_void) -> Status;
+/// `EFI_PCI_IO_PROTOCOL_IO_MEM`: width, BAR, offset in it, count, buffer.
+type MemRead = unsafe extern "efiapi" fn(*mut PciIo, u32, u8, u64, usize, *mut c_void) -> Status;
+type Location =
+    unsafe extern "efiapi" fn(*mut PciIo, *mut usize, *mut usize, *mut usize, *mut usize) -> Status;
+type BarAttributes =
+    unsafe extern "efiapi" fn(*mut PciIo, u8, *mut u64, *mut *mut c_void) -> Status;
+#[repr(C)]
+#[unsafe_protocol("4cf5b200-68b8-4ca5-9eec-b23e3f50029a")]
+pub struct PciIo {
+    poll_mem_poll_io: [usize; 2],
+    mem_read: MemRead,
+    mem_write_io: [usize; 3],
+    config_read: Read,
+    config_write_copy_map_unmap_alloc_free_flush: [usize; 7],
+    location: Location,
+    attributes: usize,
+    bar_attributes: BarAttributes,
+    set_bar_attributes: usize,
+    rom_size: u64,
+    rom_image: *mut c_void,
+}
+// This binary is x86-64 only; EFIAPI uses that target's UEFI ABI.
+const _: () = {
+    assert!(size_of::<usize>() == 8);
+    assert!(size_of::<PciIo>() == 160);
+    assert!(offset_of!(PciIo, mem_read) == 16);
+    assert!(offset_of!(PciIo, config_read) == 48);
+    assert!(offset_of!(PciIo, location) == 112);
+    assert!(offset_of!(PciIo, bar_attributes) == 128);
+    assert!(offset_of!(PciIo, rom_size) == 144);
+};
+use stela_drivers::bus::pci::Address;
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Error {
+    Firmware(Status),
+    Location,
+    BarIndex,
+    MissingResources,
+    DescriptorTag(u8),
+    DescriptorLength,
+    DescriptorRange,
+    Descriptor(DescriptorError),
+    Checksum,
+    Allocation,
+    Release(Status),
+}
+impl core::fmt::Display for Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Firmware(status) => write!(f, "firmware status {status:?}"),
+            Self::Location => f.write_str("invalid firmware PCI location"),
+            Self::BarIndex => f.write_str("invalid BAR index"),
+            Self::MissingResources => f.write_str("successful BAR call returned no pool buffer"),
+            Self::DescriptorTag(tag) => write!(f, "unsupported descriptor tag {tag:#x}"),
+            Self::DescriptorLength => f.write_str("invalid descriptor wire length"),
+            Self::DescriptorRange => f.write_str("descriptor span overflow"),
+            Self::Descriptor(error) => write!(f, "resource descriptor refused: {error:?}"),
+            Self::Checksum => f.write_str("resource descriptor checksum mismatch"),
+            Self::Allocation => f.write_str("resource observation allocation failed"),
+            Self::Release(status) => write!(f, "resource pool release failed: {status:?}"),
+        }
+    }
+}
+pub use stela_boot_core::firmware_pci::BarRegion;
+use stela_boot_core::firmware_pci::{
+    DescriptorError, FramebufferBar, decode_qword, names_pci_function, sole,
+};
+
+/// Original GOP association copied while both firmware protocols are live.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FramebufferSource {
+    pub address: Address,
+    pub bar: FramebufferBar,
+}
+
+fn get_protocol<P: ProtocolPointer + ?Sized>(handle: Handle) -> uefi::Result<ScopedProtocol<P>> {
+    // SAFETY: a scoped read-only protocol observation during boot services.
+    unsafe {
+        boot::open_protocol::<P>(
+            OpenProtocolParams {
+                handle,
+                agent: boot::image_handle(),
+                controller: None,
+            },
+            OpenProtocolAttributes::GetProtocol,
+        )
+    }
+}
+
+/// The PCI function a GOP `handle` names: the handle itself, or the
+/// function of the last PCI node of its device path, which the GOP may sit
+/// below on a child output handle.
+fn gop_pci(handle: Handle) -> Option<ScopedProtocol<PciIo>> {
+    if let Ok(pci) = get_protocol(handle) {
+        return Some(pci);
+    }
+    let path = get_protocol::<DevicePath>(handle).ok()?;
+    if path.instance_iter().count() != 1 {
+        return None;
+    }
+    let mut remaining = &*path;
+    let controller = boot::locate_device_path::<PciIo>(&mut remaining).ok()?;
+    let nodes = path
+        .node_iter()
+        .map(|node| (node.device_type().0, node.sub_type().0));
+    if !names_pci_function(nodes, remaining.node_iter().count()) {
+        return None;
+    }
+    get_protocol(controller).ok()
+}
+
+/// Which PCI function's memory BAR holds the firmware screen.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ScreenOwner {
+    /// Firmware left no screen.
+    NoScreen,
+    /// This function, checked before and after firmware exit.
+    Function(FramebufferSource),
+    /// No function was found. A GPU on a bus apart from the screen
+    /// (`firmware_screen`) cannot hold it and leaves it to the adapter
+    /// showing it; any other GPU may, so the firmware screen stops before it
+    /// starts and no screen writer can race its BAR changes.
+    Unknown(stela_boot_core::firmware_screen::BusesApart),
+}
+
+/// The firmware screen at `base` for `bytes`, when one display-class
+/// function's BAR holds it. Tried in order: the function the active GOP
+/// `handle` names, those every other GOP handle names, then every
+/// display-class function by its BARs, as when GOP sits on a console
+/// splitter's virtual handle or firmware gives it no device path. Only a
+/// pool buffer firmware kept is an error; a function that cannot be read is
+/// logged and skipped.
+pub(crate) fn framebuffer_source(
+    handle: Handle,
+    base: u64,
+    bytes: u64,
+) -> Result<Option<FramebufferSource>, Error> {
+    let end = base.checked_add(bytes).ok_or(Error::DescriptorRange)?;
+    let screen = base..end;
+    let gops = boot::find_handles::<GraphicsOutput>().unwrap_or_default();
+    let named = core::iter::once(handle).chain(gops.into_iter().filter(|other| *other != handle));
+    for candidate in named {
+        if let Some(mut pci) = gop_pci(candidate)
+            && let Some(source) = display_source(&mut pci, &screen)?
+        {
+            return Ok(Some(source));
+        }
+    }
+    let mut matched = Vec::new();
+    for candidate in boot::find_handles::<PciIo>().unwrap_or_default() {
+        if let Ok(mut pci) = get_protocol::<PciIo>(candidate)
+            && let Some(source) = display_source(&mut pci, &screen)?
+        {
+            matched.try_reserve(1).map_err(|_| Error::Allocation)?;
+            matched.push(source);
+        }
+    }
+    let source = sole(matched);
+    if let Some(source) = source {
+        crate::output::arguments(format_args!(
+            "GOP PCI source {} found by its BAR{} holding the screen\n",
+            source.address,
+            source.bar.index()
+        ));
+    }
+    Ok(source)
+}
+
+/// `pci`'s BAR holding `screen`, when it is a display-class function.
+fn display_source(
+    pci: &mut PciIo,
+    screen: &Range<u64>,
+) -> Result<Option<FramebufferSource>, Error> {
+    match observe_display(pci, screen) {
+        Err(error @ Error::Release(_)) => Err(error),
+        Err(error) => {
+            crate::output::arguments(format_args!(
+                "GOP PCI source observation skipped a function: {error}\n"
+            ));
+            Ok(None)
+        }
+        Ok(source) => Ok(source),
+    }
+}
+
+fn observe_display(
+    pci: &mut PciIo,
+    screen: &Range<u64>,
+) -> Result<Option<FramebufferSource>, Error> {
+    let header = pci.read_header()?;
+    // Only display-class functions own a firmware screen.
+    if header[0x0b] != 3 {
+        return Ok(None);
+    }
+    let address = pci.address()?;
+    let mut bars = Vec::new();
+    bars.try_reserve_exact(6).map_err(|_| Error::Allocation)?;
+    for index in 0..6 {
+        match pci.bar_regions(index) {
+            Ok(regions) => bars.push((index, regions)),
+            Err(Error::Firmware(Status::UNSUPPORTED)) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    let bar = FramebufferBar::observe(
+        &header,
+        bars.iter().filter_map(|(index, regions)| {
+            let [region] = regions.as_slice() else {
+                return None;
+            };
+            Some((*index, region))
+        }),
+        screen.clone(),
+    );
+    if bar.is_none() {
+        report_unmatched(address, &header, &bars, screen);
+    }
+    Ok(bar.map(|bar| FramebufferSource { address, bar }))
+}
+
+/// One line naming what the firmware said of each BAR of the display
+/// function at `address` that none was matched to the screen: when no
+/// function is, the screen's owner stays unknown, and these words tell why.
+fn report_unmatched(
+    address: Address,
+    header: &[u8; 64],
+    bars: &[(u8, Vec<BarRegion>)],
+    screen: &Range<u64>,
+) {
+    use alloc::string::String;
+    use core::fmt::Write;
+    let mut line = String::new();
+    for (index, regions) in bars {
+        let word = 0x10 + usize::from(*index) * 4;
+        let low = u32::from_le_bytes([
+            header[word],
+            header[word + 1],
+            header[word + 2],
+            header[word + 3],
+        ]);
+        let _ = write!(line, " BAR{index} word={low:#x}");
+        for region in regions {
+            let _ = write!(
+                line,
+                " [type={} granularity={} host={:#x}..{:#x} translation={:#x}]",
+                region.resource_type,
+                region.granularity,
+                region.host.start,
+                region.host.end,
+                region.translation
+            );
+        }
+    }
+    crate::output::arguments(format_args!(
+        "GOP PCI source {address}: no BAR holds the screen at {:#x}..{:#x};{line}\n",
+        screen.start, screen.end
+    ));
+}
+/// The Bochs-compatible virtual display device (PCI 1234:1111, QEMU's
+/// standard VGA, `hw/display/vga-pci.c`), vendor and device. No PC graphics
+/// card has this ID, so the paths below run only on a virtual machine.
+const BOCHS_DISPLAY: u32 = 0x1111_1234;
+/// Its MMIO BAR, whose first bytes hold the EDID with `edid=on`
+/// (QEMU's `docs/specs/standard-vga.rst`: 0x0000..0x0400 "edid data blob").
+const DISPLAY_MMIO_BAR: u8 = 2;
+const EDID_BYTES: usize = 128;
+
+/// The EDID base block the virtual display device on GOP `handle` serves in its
+/// registers, which OVMF reads to pick its first mode but does not install
+/// as a protocol. `None` for another device or when the read fails; the
+/// caller checks the block.
+pub(crate) fn bochs_display_edid(handle: Handle) -> Option<Vec<u8>> {
+    let mut pci = gop_pci(handle)?;
+    let header = pci.read_header().ok()?;
+    if u32::from_le_bytes(header[..4].try_into().ok()?) != BOCHS_DISPLAY {
+        return None;
+    }
+    let mut edid = Vec::new();
+    edid.try_reserve_exact(EDID_BYTES).ok()?;
+    edid.resize(EDID_BYTES, 0);
+    // SAFETY: live boot protocol; EfiPciIoWidthUint8 (0) reads `EDID_BYTES`
+    // single bytes from the BAR into the writable buffer of that length.
+    let read = unsafe {
+        (pci.mem_read)(
+            &mut *pci,
+            0,
+            DISPLAY_MMIO_BAR,
+            0,
+            EDID_BYTES,
+            edid.as_mut_ptr().cast(),
+        )
+    };
+    read.is_success().then_some(edid)
+}
+
+/// The Bochs DISPI registers in the virtual display's MMIO BAR, 16 bits
+/// each (QEMU's `docs/specs/standard-vga.rst`: 0x0500..0x0516), by index
+/// (`include/hw/display/bochs-vbe.h`).
+pub(crate) const DISPI_REGISTERS: u64 = 0x500;
+pub(crate) const DISPI_VIRT_WIDTH: u64 = 6;
+pub(crate) const DISPI_X_OFFSET: u64 = 8;
+pub(crate) const DISPI_Y_OFFSET: u64 = 9;
+const DISPI_VIDEO_MEMORY_64K: u64 = 0xa;
+
+/// The physical address of the DISPI registers of the virtual display on
+/// GOP `handle`, when its screen at `base` starts its video memory, shows
+/// rows of `stride` pixels from its top and the video memory holds a second
+/// frame of `frame_bytes` after it: the screen can then show either.
+pub(crate) fn bochs_display_flip(
+    handle: Handle,
+    base: u64,
+    stride: usize,
+    frame_bytes: u64,
+) -> Option<u64> {
+    let mut pci = gop_pci(handle)?;
+    let header = pci.read_header().ok()?;
+    if u32::from_le_bytes(header[..4].try_into().ok()?) != BOCHS_DISPLAY {
+        return None;
+    }
+    let single = |regions: Vec<BarRegion>| match regions.as_slice() {
+        [region] => Some(region.host.clone()),
+        _ => None,
+    };
+    let memory = single(pci.bar_regions(0).ok()?)?;
+    let registers = single(pci.bar_regions(DISPLAY_MMIO_BAR).ok()?)?;
+    let mut register = |index: u64| {
+        let mut value = 0u16;
+        // SAFETY: live boot protocol; EfiPciIoWidthUint16 (1) reads one
+        // register into the local.
+        let read = unsafe {
+            (pci.mem_read)(
+                &mut *pci,
+                1,
+                DISPLAY_MMIO_BAR,
+                DISPI_REGISTERS + index * 2,
+                1,
+                ptr::from_mut(&mut value).cast(),
+            )
+        };
+        read.is_success().then_some(value)
+    };
+    let video_memory = u64::from(register(DISPI_VIDEO_MEMORY_64K)?) << 16;
+    let fits = memory.start == base
+        && 2 * frame_bytes <= video_memory.min(memory.end - memory.start)
+        && usize::from(register(DISPI_VIRT_WIDTH)?) == stride
+        && register(DISPI_X_OFFSET)? == 0
+        && register(DISPI_Y_OFFSET)? == 0
+        && registers.end - registers.start >= DISPI_REGISTERS + 0x20;
+    fits.then_some(registers.start + DISPI_REGISTERS)
+}
+
+fn status(value: Status) -> Result<(), Error> {
+    if value.is_success() {
+        Ok(())
+    } else {
+        Err(Error::Firmware(value))
+    }
+}
+impl PciIo {
+    // Only a live ScopedProtocol obtained from firmware can construct a
+    // usable borrow; no copy of this callback-bearing object enters a Handoff.
+    pub fn address(&mut self) -> Result<Address, Error> {
+        let (mut segment, mut bus, mut device, mut function) = (0, 0, 0, 0);
+        // SAFETY: original scoped firmware protocol, EFIAPI signature,
+        // writable local UINTN outputs; boot services remain active.
+        status(unsafe {
+            (self.location)(self, &mut segment, &mut bus, &mut device, &mut function)
+        })?;
+        if device >= 32 || function >= 8 {
+            return Err(Error::Location);
+        }
+        Ok(Address {
+            segment: segment.try_into().map_err(|_| Error::Location)?,
+            bus: bus.try_into().map_err(|_| Error::Location)?,
+            device: device as u8,
+            function: function as u8,
+        })
+    }
+    pub fn read_header(&mut self) -> Result<[u8; 64], Error> {
+        let mut header = [0; 64];
+        // Width0=EfiPciIoWidthUint8, count64 bytes; no raw ECAM access.
+        // SAFETY: live boot protocol and bounded writable local output; the
+        // firmware performs its own controller/configuration addressing.
+        status(unsafe {
+            (self.config_read)(self, 0, 0, header.len(), header.as_mut_ptr().cast())
+        })?;
+        Ok(header)
+    }
+    pub fn bar_regions(&mut self, index: u8) -> Result<Vec<BarRegion>, Error> {
+        if index >= 6 {
+            return Err(Error::BarIndex);
+        }
+        let mut raw = ptr::null_mut();
+        // SAFETY: live EFIAPI protocol; Resources is a writable VOID**.
+        // Supports is optional and unused. A successful response is a firmware
+        // pool allocation containing a complete EndTag-terminated resource list.
+        status(unsafe { (self.bar_attributes)(self, index, ptr::null_mut(), &mut raw) })?;
+        let raw = NonNull::new(raw.cast::<u8>()).ok_or(Error::MissingResources)?;
+        // SAFETY: successful protocol contract supplies the original complete
+        // descriptor allocation. Only exact protocol-described records are read.
+        let result = unsafe { copy_regions(raw) };
+        // FreePool happens even for a refused descriptor; explicit failure is
+        // returned instead of hiding release status in an infallible Drop.
+        // SAFETY: original successful pool allocation, copied records own all
+        // returned DATA and hold no firmware pointers. This is called once even
+        // when copy_regions refuses the descriptor. On FreePool failure the
+        // pool remains firmware-owned and caller must stop preparation.
+        unsafe { uefi::boot::free_pool(raw) }.map_err(|error| Error::Release(error.status()))?;
+        result
+    }
+}
+/// # Safety
+/// `base` is the original successful GetBarAttributes pool allocation and
+/// contains its complete valid readable EndTag-terminated descriptor chain.
+/// Firmware callback lifetime is still active. No synthetic slice length is
+/// invented; malformed headers are refused before reading a descriptor body.
+unsafe fn copy_regions(base: NonNull<u8>) -> Result<Vec<BarRegion>, Error> {
+    let mut result = Vec::new();
+    let mut offset = 0usize;
+    let mut checksum = 0u8;
+    loop {
+        // SAFETY: caller keeps the protocol's complete descriptor chain;
+        // offset advances only by checked lengths of specified descriptors.
+        let tag = unsafe { base.as_ptr().add(offset).read() };
+        match tag {
+            0x79 => {
+                let end = offset
+                    .checked_add(2)
+                    .filter(|n| *n <= isize::MAX as usize)
+                    .ok_or(Error::DescriptorRange)?;
+                // SAFETY: the small EndTag record has its checksum byte.
+                let value = unsafe { base.as_ptr().add(end - 1).read() };
+                if value != 0 && checksum.wrapping_add(tag).wrapping_add(value) != 0 {
+                    return Err(Error::Checksum);
+                }
+                return Ok(result);
+            }
+            0x8a => {
+                let end = offset
+                    .checked_add(46)
+                    .filter(|n| *n <= isize::MAX as usize)
+                    .ok_or(Error::DescriptorRange)?;
+                // SAFETY: the large-record header is part of the chain.
+                let length = unsafe {
+                    u16::from_le_bytes([
+                        base.as_ptr().add(offset + 1).read(),
+                        base.as_ptr().add(offset + 2).read(),
+                    ])
+                };
+                if length != 43 {
+                    return Err(Error::DescriptorLength);
+                }
+                let mut bytes = [0; 46];
+                // SAFETY: exact standard-sized record after validated header;
+                // local output is distinct and has exactly46 writable bytes.
+                unsafe {
+                    ptr::copy_nonoverlapping(
+                        base.as_ptr().add(offset),
+                        bytes.as_mut_ptr(),
+                        bytes.len(),
+                    );
+                }
+                let observed = decode_qword(&bytes).map_err(Error::Descriptor)?;
+                result.try_reserve(1).map_err(|_| Error::Allocation)?;
+                result.push(observed);
+                checksum = bytes
+                    .iter()
+                    .fold(checksum, |sum, byte| sum.wrapping_add(*byte));
+                offset = end;
+            }
+            other => return Err(Error::DescriptorTag(other)),
+        }
+    }
+}
+
+/// No handles/protocol pointers escape this firmware-only census. All native
+/// functions (including those without a firmware handle) must still be found
+/// through the later root configuration factory and identity rechecked.
+pub struct Census {
+    pub functions: Vec<FunctionObservation>,
+    pub failures: Vec<CaptureFailure>,
+}
+pub struct FunctionObservation {
+    pub address: Address,
+    pub header: [u8; 64],
+    // A missing/unimplemented BAR is preserved as the firmware status;
+    // it is not turned into an empty device or a guessed identity translation.
+    pub bars: [Result<Vec<BarRegion>, Error>; 6],
+}
+impl FunctionObservation {
+    /// Copied firmware fields, to be revalidated under a real native owner.
+    pub fn identity(&self) -> stela_drivers::bus::pci::Identity {
+        header_identity(self.address, &self.header)
+    }
+}
+
+/// The identity a function's configuration `header` gives.
+fn header_identity(address: Address, header: &[u8; 64]) -> stela_drivers::bus::pci::Identity {
+    let word = |offset: usize| u16::from_le_bytes([header[offset], header[offset + 1]]);
+    stela_drivers::bus::pci::Identity {
+        address,
+        vendor: word(0),
+        device: word(2),
+        class: [header[11], header[10], header[9]],
+    }
+}
+#[derive(Debug)]
+pub enum CaptureFailure {
+    Enumeration(Status),
+    Open(Status),
+    Function(Error),
+    Allocation,
+}
+pub fn capture() -> Result<Census, CaptureFailure> {
+    use uefi::boot::{self, OpenProtocolAttributes, OpenProtocolParams};
+    let handles = boot::find_handles::<PciIo>()
+        .map_err(|error| CaptureFailure::Enumeration(error.status()))?;
+    let mut result = Census {
+        functions: Vec::new(),
+        failures: Vec::new(),
+    };
+    // Reserve before starting callbacks, so an allocation refusal never leaves
+    // a protocol, returned pool allocation or callback-bearing token kept.
+    result
+        .functions
+        .try_reserve_exact(handles.len())
+        .map_err(|_| CaptureFailure::Allocation)?;
+    result
+        .failures
+        .try_reserve_exact(handles.len())
+        .map_err(|_| CaptureFailure::Allocation)?;
+    for handle in handles {
+        // SAFETY: GetProtocol is the firmware's scoped instance. This
+        // consumer only reads header/GetLocation/GetBarAttributes; the firmware
+        // keeps controller driving/reset permission until EBS handoff.
+        // All borrowed callbacks and returned pool storage end in this loop.
+        let mut protocol = match unsafe {
+            boot::open_protocol::<PciIo>(
+                OpenProtocolParams {
+                    handle,
+                    agent: boot::image_handle(),
+                    controller: None,
+                },
+                OpenProtocolAttributes::GetProtocol,
+            )
+        } {
+            Ok(protocol) => protocol,
+            Err(error) => {
+                result.failures.push(CaptureFailure::Open(error.status()));
+                continue;
+            }
+        };
+        let address = match protocol.address() {
+            Ok(address) => address,
+            Err(error) => {
+                result.failures.push(CaptureFailure::Function(error));
+                continue;
+            }
+        };
+        let header = match protocol.read_header() {
+            Ok(header) => header,
+            Err(error) => {
+                result.failures.push(CaptureFailure::Function(error));
+                continue;
+            }
+        };
+        let bars = core::array::from_fn(|bar| protocol.bar_regions(bar as u8));
+        // FreePool refusal cannot be followed by EBS as though reclamation had
+        // succeeded. Caller stops preparation with the status kept.
+        if let Some(status) = bars.iter().find_map(|bar| match bar {
+            Err(Error::Release(status)) => Some(*status),
+            _ => None,
+        }) {
+            return Err(CaptureFailure::Function(Error::Release(status)));
+        }
+        result.functions.push(FunctionObservation {
+            address,
+            header,
+            bars,
+        });
+    }
+    Ok(result)
+}
+
+impl core::fmt::Display for CaptureFailure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Enumeration(status) => write!(f, "enumerate protocol: {status:?}"),
+            Self::Open(status) => write!(f, "open protocol: {status:?}"),
+            Self::Function(error) => write!(f, "observe function: {error}"),
+            Self::Allocation => f.write_str("protocol census allocation failed"),
+        }
+    }
+}
+
+/// Where the firmware found the disk behind `handle`: its controller's PCI
+/// address and the device path nodes below the controller up to the
+/// partition, such as `0000:0b:00.3 USB(0x3,0x0)`. Identifiers a node may
+/// carry (a USB serial number, an NVMe EUI-64) are left out.
+pub(crate) fn disk_location(handle: Handle) -> Option<alloc::string::String> {
+    use alloc::string::ToString;
+    use uefi::proto::device_path::text::{AllowShortcuts, DisplayOnly};
+    let path = get_protocol::<DevicePath>(handle).ok()?;
+    let mut remaining = &*path;
+    let controller = boot::locate_device_path::<PciIo>(&mut remaining).ok()?;
+    let address = get_protocol::<PciIo>(controller).ok()?.address().ok()?;
+    let below = remaining
+        .to_string16(DisplayOnly(false), AllowShortcuts(false))
+        .ok()
+        .map(|text| text.to_string())
+        .unwrap_or_default();
+    Some(alloc::format!("{address} {}", plain_nodes(&below)))
+}
+
+/// The class code (configuration bytes 0x0b, 0x0a, 0x09) of the PCI
+/// function `handle` is: `None` when it is no PCI function, `Some(None)`
+/// when its configuration cannot be read.
+pub(crate) fn function_class(handle: Handle) -> Option<Option<u32>> {
+    let mut io = get_protocol::<PciIo>(handle).ok()?;
+    let mut bytes = [0u8; 4];
+    // Width0=EfiPciIoWidthUint8, the revision and class bytes at 0x08.
+    // SAFETY: live boot protocol and bounded writable local output.
+    let read = status(unsafe {
+        (io.config_read)(&mut *io, 0, 0x08, bytes.len(), bytes.as_mut_ptr().cast())
+    });
+    Some(read.ok().map(|()| u32::from_le_bytes(bytes) >> 8))
+}
+
+/// The PCI address of the function `handle` is.
+pub(crate) fn function_address(handle: Handle) -> Option<Address> {
+    get_protocol::<PciIo>(handle).ok()?.address().ok()
+}
+
+/// The identity of the PCI controller the disk behind `handle` hangs from,
+/// as its configuration header gives it.
+pub(crate) fn disk_controller(handle: Handle) -> Option<stela_drivers::bus::pci::Identity> {
+    let path = get_protocol::<DevicePath>(handle).ok()?;
+    let mut remaining = &*path;
+    let controller = boot::locate_device_path::<PciIo>(&mut remaining).ok()?;
+    let mut io = get_protocol::<PciIo>(controller).ok()?;
+    let address = io.address().ok()?;
+    Some(header_identity(address, &io.read_header().ok()?))
+}
+
+/// The device path nodes of `text` before the partition, without any
+/// identifier a node carries beyond its bus position and IDs.
+fn plain_nodes(text: &str) -> alloc::string::String {
+    let mut kept = Vec::new();
+    for node in text.split('/') {
+        if node.starts_with("HD(") || node.starts_with("CDROM(") {
+            break;
+        }
+        let arguments = |count: usize| {
+            let (name, rest) = node.split_once('(').unwrap_or((node, ""));
+            let rest = rest.trim_end_matches(')');
+            let first: Vec<&str> = rest.split(',').take(count).collect();
+            alloc::format!("{name}({})", first.join(","))
+        };
+        if node.starts_with("UsbWwid(") {
+            kept.push(arguments(2));
+        } else if node.starts_with("NVMe(") {
+            kept.push(arguments(1));
+        } else if ["USB(", "UsbClass(", "Sata(", "Scsi(", "SD(", "eMMC("]
+            .iter()
+            .any(|prefix| node.starts_with(prefix))
+        {
+            kept.push(alloc::string::String::from(node));
+        }
+    }
+    kept.join("/")
+}
+
+/// xHCI register reads through the firmware's protocol, which reaches the
+/// BAR whatever the firmware's page tables map.
+struct XhciBar<'a>(&'a mut PciIo);
+
+impl stela_boot_core::usb_legacy::Dwords for XhciBar<'_> {
+    fn read32(&mut self, offset: usize) -> u32 {
+        let mut value = u32::MAX;
+        // SAFETY: live boot protocol; EfiPciIoWidthUint32 (2) reads one
+        // dword of BAR 0 into the writable local. A refused read leaves
+        // all ones, which every reader takes as absent registers.
+        let _ =
+            unsafe { (self.0.mem_read)(self.0, 2, 0, offset as u64, 1, (&raw mut value).cast()) };
+        value
+    }
+    // The firmware still drives the controller: nothing is written here.
+    fn write32(&mut self, _: usize, _: u32) {}
+}
+
+/// Each xHCI controller the firmware decodes, with the physical address of
+/// its USB Legacy Support capability, for
+/// [`stela_boot_core::usb_legacy::take`] once the firmware has exited. A
+/// controller without the capability, or one whose registers the firmware
+/// does not place in memory, is left out.
+pub(crate) fn xhci_legacy_capabilities() -> Vec<(Address, u64)> {
+    const XHCI_CLASS: [u8; 3] = [0x30, 0x03, 0x0c];
+    const COMMAND_MEMORY: u8 = 1 << 1;
+    let mut found = Vec::new();
+    let Ok(handles) = boot::find_handles::<PciIo>() else {
+        return found;
+    };
+    for handle in handles {
+        let Ok(mut io) = get_protocol::<PciIo>(handle) else {
+            continue;
+        };
+        let (Ok(address), Ok(header)) = (io.address(), io.read_header()) else {
+            continue;
+        };
+        if header[0x09..0x0c] != XHCI_CLASS || header[0x04] & COMMAND_MEMORY == 0 {
+            continue;
+        }
+        // A memory resource (type 0) the processor reaches without
+        // translation: the address read after the exit is then the one the
+        // firmware's own driver used.
+        let Some(window) = io.bar_regions(0).ok().and_then(|regions| {
+            regions
+                .into_iter()
+                .find(|region| region.resource_type == 0 && region.translation == 0)
+                .map(|region| region.host)
+        }) else {
+            continue;
+        };
+        let Ok(bytes) = usize::try_from(window.end.saturating_sub(window.start)) else {
+            continue;
+        };
+        if window.start == 0 {
+            continue;
+        }
+        if let Some(at) = stela_boot_core::usb_legacy::find(&mut XhciBar(&mut io), bytes) {
+            found.push((address, window.start + at as u64));
+        }
+    }
+    found
+}

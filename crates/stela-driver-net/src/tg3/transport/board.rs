@@ -1,0 +1,512 @@
+// SPDX-License-Identifier: GPL-2.0-only
+// Copyright (C) 2001-2004 David S. Miller
+// Copyright (C) 2001-2003 Jeff Garzik
+// Copyright (C) 2004 Sun Microsystems Inc.
+// Copyright (C) 2005-2018 Broadcom
+//! Signed board settings, VMain selection and read-only per-ASIC NVRAM.
+use super::{regs::*, *};
+use crate::Mac;
+
+#[derive(Clone, Copy)]
+pub(in crate::tg3) struct Board {
+    pub mac: Mac,
+    pub local: u32,
+    pub led: u32,
+    pub apd: bool,
+    pub capacitive: bool,
+    pub profile_5762: Option<super::bcm5762::Profile>,
+    pub profile_5761: Option<super::bcm5761::Profile>,
+    /// A 5784's PHY trim from its OTP (`tg3_read_otp_phycfg`); zero for
+    /// every other chip.
+    pub phy_otp: u32,
+}
+impl<R: Registers, D: Delay> Hardware<R, D> {
+    /// Only matching copper BCM5720/5761/5762 A0 or BCM5717/5718/5719
+    /// after A0 is a packet candidate.
+    pub(super) async fn packet_identity(&mut self) -> Result<Identity, Error> {
+        self.timer_ready()?;
+        // Read static PCI/subsystem denials before identify changes host/MMIO
+        // access controls. PCI table membership alone never authorizes packets.
+        let pci = Self::checked(self.regs().config_read32(0)?)?;
+        if matches!(pci, 0x1680_14e4 | 0x1681_14e4 | 0x1688_14e4 | 0x1689_14e4)
+            && (Self::checked(self.regs().config_read32(PRODID)?)? != 0x0576_1000
+                || self.regs().function_number() != 0)
+        {
+            return Err(Error::UnsupportedRevision);
+        }
+        if pci == 0x1687_14e4 {
+            let revision = Self::checked(self.regs().config_read32(GEN2_PRODID)?)?;
+            if revision != 0x0576_2000 {
+                return Err(Error::UnsupportedRevision);
+            }
+            self.bcm5762_subsystem()?;
+        }
+        let id = self.identify()?;
+        // Upper bits identify the ASIC, lower 12 keep revision/metal. This
+        // packet backend implements exact A0 deltas; no extrapolated IDs.
+        // BCM5717/5718 and BCM5719 are the exception: tg3 singles out only
+        // their A0, whose PHY strap, EEE, TSO, jumbo ring, statistics and
+        // read DMA errata are not implemented here, and treats every later
+        // revision alike (a 5717 C0 is identified as a 5720 A0).
+        // tg3 has no 57766 revision errata: every 57766 is admitted.
+        // A 5784 AX's CPMU clock, MAC prescaler and LED errata are not
+        // implemented; later 5784 revisions share one path in tg3.
+        let admitted = if id.asic == Asic::Bcm57766 {
+            true
+        } else if id.asic == Asic::Bcm5784 {
+            id.chip_revision >> 8 != CHIPREV_5784_AX
+        } else if id.asic == Asic::Bcm57765 {
+            id.chip_revision != CHIPREV_ID_57765_A0
+        } else if id.asic == Asic::Bcm5717 {
+            id.chip_revision != CHIPREV_ID_5717_A0
+        } else if id.asic == Asic::Bcm5719 {
+            id.chip_revision != CHIPREV_ID_5719_A0
+        } else {
+            id.chip_revision & 0xfff == 0
+        };
+        if !admitted {
+            return Err(Error::UnsupportedRevision);
+        }
+        self.observe_management()?;
+        self.phy_identity().await?;
+        Ok(id)
+    }
+    pub(super) async fn board(&mut self) -> Result<Board, Error> {
+        if self.identity.ok_or(Error::NotIdentified)?.asic == Asic::Bcm5761 {
+            return self.bcm5761_board().await;
+        }
+        if self.identity.ok_or(Error::NotIdentified)?.asic == Asic::Bcm5762 {
+            return self.bcm5762_board().await;
+        }
+        self.observe_management()?;
+        let config = self.sram(NIC_SRAM_DATA_CFG, None)?;
+        if config & NIC_SRAM_DATA_CFG_PHY_TYPE_MASK == NIC_SRAM_DATA_CFG_PHY_TYPE_FIBER {
+            return Err(Error::UnsupportedMedia);
+        }
+        let version = self.sram(NIC_SRAM_DATA_VER, None)? >> NIC_SRAM_DATA_VER_SHIFT;
+        let cfg2 = if version > 0 && version < 0x100 {
+            self.sram(NIC_SRAM_DATA_CFG_2, None)?
+        } else {
+            0
+        };
+        let asic = self.identity.unwrap().asic;
+        let mut local = GRC_LCLCTRL_INT_ON_ATTN | GRC_LCLCTRL_AUTO_SEEPROM;
+        // tg3_get_invariants: the 57765 class turns the debug UART off.
+        if asic.class_57765() {
+            local |= GRC_LCLCTRL_GPIO_UART_SEL;
+        }
+        if config & NIC_SRAM_DATA_CFG_EEPROM_WP != 0 {
+            // LOM GPIO settings are bootcode-owned and must be preserved.
+            local |= self.read(GRC_LOCAL_CTRL)?
+                & (GRC_LCLCTRL_GPIO_OE0
+                    | GRC_LCLCTRL_GPIO_OE1
+                    | GRC_LCLCTRL_GPIO_OE2
+                    | GRC_LCLCTRL_GPIO_OUTPUT0
+                    | GRC_LCLCTRL_GPIO_OUTPUT1
+                    | GRC_LCLCTRL_GPIO_OUTPUT2);
+            local |= GRC_LCLCTRL_GPIO_OE1 | GRC_LCLCTRL_GPIO_OUTPUT1;
+        } else if !asic.plus_5717() {
+            // tg3_pwrsrc_switch_to_vmain outside the 5717 class: the local
+            // control alone, with no GPIO lock or driver-present bits.
+            self.flush(GRC_LOCAL_CTRL, local)?;
+            self.wait(100).await?;
+        } else {
+            // tg3_pwrsrc_switch_to_vmain: internal port, not BDF.
+            // tg3_set_function_status keeps 5717/5719's driver-present bits
+            // in the APE and 5720's in the CPMU.
+            self.lock(7).await?;
+            let result = async {
+                let identity = self.identity.unwrap();
+                let shift = TG3_APE_GPIO_MSG_SHIFT + 4 * u32::from(identity.function);
+                if matches!(identity.asic, Asic::Bcm5717 | Asic::Bcm5719) {
+                    let status = self.ape_read(TG3_APE_GPIO_MSG)?;
+                    self.regs()
+                        .ape_write32(TG3_APE_GPIO_MSG, (status & !(3 << shift)) | (1 << shift))?;
+                } else {
+                    let status = self.read(TG3_CPMU_DRV_STATUS)?;
+                    self.flush(TG3_CPMU_DRV_STATUS, (status & !(3 << shift)) | (1 << shift))?;
+                }
+                self.flush(GRC_LOCAL_CTRL, local)?;
+                self.wait(100).await?;
+                Ok(())
+            }
+            .await;
+            let release = self.unlock(7);
+            self.combine(result, release)?;
+        }
+        self.flush(
+            GRC_EEPROM_ADDR,
+            EEPROM_ADDR_FSM_RESET | (EEPROM_DEFAULT_CLOCK_PERIOD << EEPROM_ADDR_CLKPERD_SHIFT),
+        )?;
+        self.wait(1000).await?;
+        let saved_local = self.read(GRC_LOCAL_CTRL)?;
+        self.flush(GRC_LOCAL_CTRL, saved_local | GRC_LCLCTRL_AUTO_SEEPROM)?;
+        self.wait(100).await?;
+        // Decode the pinstrap, including Atmel non-power-of-two pages.
+        // No unrecognized NVM is treated as a functional firmware source.
+        let nvcfg = self.nvram_configuration().await?;
+        let Some(kind) = nvram_kind(asic, nvcfg & NVRAM_CFG1_5752VENDOR_MASK) else {
+            return Err(Error::UnsupportedBoard);
+        };
+        let eeprom = kind == Nvram::Eeprom;
+        let atmel = kind == Nvram::Atmel;
+        let page = if eeprom {
+            0
+        } else if asic == Asic::Bcm5784 {
+            // tg3_get_5787_nvram_info fixes the page by part, not strap.
+            if atmel { 264 } else { 256 }
+        } else {
+            match nvcfg & NVRAM_CFG1_5752PAGE_SIZE_MASK {
+                FLASH_5752PAGE_SIZE_256 => 256,
+                FLASH_5752PAGE_SIZE_512 => 512,
+                FLASH_5752PAGE_SIZE_1K => 1024,
+                FLASH_5752PAGE_SIZE_2K => 2048,
+                FLASH_5752PAGE_SIZE_4K => 4096,
+                FLASH_5752PAGE_SIZE_264 => 264,
+                FLASH_5752PAGE_SIZE_528 => 528,
+                _ => return Err(Error::UnsupportedBoard),
+            }
+        };
+        let high = self.sram(NIC_SRAM_MAC_ADDR_HIGH_MBOX, None)?;
+        let low = self.sram(NIC_SRAM_MAC_ADDR_LOW_MBOX, None)?;
+        let mut mac = decode_mac(high, low);
+        if high >> 16 != 0x484b || !valid_mac(mac) {
+            // tg3_get_device_address: only 5717_PLUS ports have their own.
+            let function = self.identity.unwrap().function;
+            let offset = if asic.plus_5717() {
+                0x7c + if function & 1 != 0 { 0x50 } else { 0 }
+                    + if function > 1 { 0x18c } else { 0 }
+            } else {
+                0x7c
+            };
+            let high = self
+                .nvram_word(offset, atmel && matches!(page, 264 | 528), page)
+                .await?;
+            let low = self
+                .nvram_word(offset + 4, atmel && matches!(page, 264 | 528), page)
+                .await?;
+            mac = decode_mac(high, low);
+        }
+        if !usable_mac(mac) {
+            mac = self.fallback_mac()?;
+        }
+        let led = super::board::decode_led(cfg2)?;
+        let phy_otp = if asic == Asic::Bcm5784 {
+            self.bcm5784_board().await?
+        } else {
+            0
+        };
+        Ok(Board {
+            mac,
+            local,
+            led,
+            apd: cfg2 & NIC_SRAM_DATA_CFG_2_APD_EN != 0,
+            capacitive: cfg2 & (1 << 17) != 0,
+            profile_5762: None,
+            profile_5761: None,
+            phy_otp,
+        })
+    }
+    /// A 5784's board deltas in `tg3_get_invariants` and
+    /// `tg3_get_eeprom_hw_cfg`: the PCIe endpoint's CLKREQ_BUG from its
+    /// first observed Link Control, the PHY trim from OTP
+    /// (`TG3_OTP_DEFAULT` when unreadable), and a refusal of the
+    /// ASPM_WORKAROUND board, whose per-link L1 threshold changes are not
+    /// implemented.
+    async fn bcm5784_board(&mut self) -> Result<u32, Error> {
+        if self.sram(NIC_SRAM_DATA_CFG_3, None)? & NIC_SRAM_ASPM_DEBOUNCE != 0 {
+            return Err(Error::UnsupportedBoard);
+        }
+        let pcie = self.pcie_capability()?;
+        let control = Self::checked(self.regs().config_read32(pcie + 0x10)?)? as u16;
+        if control == u16::MAX {
+            return Err(Error::Removed);
+        }
+        self.clkreq_bug.get_or_insert(control & 0x100 != 0);
+        self.write(OTP_MODE, OTP_MODE_OTP_THRU_GRC)?;
+        let otp = async {
+            if !self.otp_command(OTP_CTRL_OTP_CMD_INIT).await? {
+                return Ok(0);
+            }
+            self.write(OTP_ADDRESS, OTP_ADDRESS_MAGIC1)?;
+            if !self.otp_command(OTP_CTRL_OTP_CMD_READ).await? {
+                return Ok(0);
+            }
+            let top = self.regs().read32(OTP_READ_DATA)?;
+            self.write(OTP_ADDRESS, OTP_ADDRESS_MAGIC2)?;
+            if !self.otp_command(OTP_CTRL_OTP_CMD_READ).await? {
+                return Ok(0);
+            }
+            let bottom = self.regs().read32(OTP_READ_DATA)?;
+            Ok::<_, Error>(((top & 0xffff) << 16) | (bottom >> 16))
+        }
+        .await?;
+        Ok(if otp == 0 { TG3_OTP_DEFAULT } else { otp })
+    }
+    /// `tg3_issue_otp_command`: up to 1 ms for the command to finish.
+    async fn otp_command(&mut self, command: u32) -> Result<bool, Error> {
+        self.write(OTP_CTRL, command | OTP_CTRL_OTP_CMD_START)?;
+        self.write(OTP_CTRL, command)?;
+        for _ in 0..100 {
+            if self.read(OTP_STATUS)? & OTP_STATUS_CMD_DONE != 0 {
+                return Ok(true);
+            }
+            self.wait(10).await?;
+        }
+        Ok(self.read(OTP_STATUS)? & OTP_STATUS_CMD_DONE != 0)
+    }
+    pub(super) async fn nvram_configuration(&mut self) -> Result<u32, Error> {
+        self.nvram_lock().await?;
+        let result = async {
+            let access = self.read(NVRAM_ACCESS)?;
+            self.flush(NVRAM_ACCESS, access | ACCESS_ENABLE)?;
+            let config = self.read(NVRAM_CFG1)?;
+            let vendor = config & NVRAM_CFG1_5752VENDOR_MASK;
+            let eeprom = match self.identity.ok_or(Error::NotIdentified)?.asic {
+                Asic::Bcm5762 => matches!(vendor, FLASH_5762_EEPROM_HD | FLASH_5762_EEPROM_LD),
+                asic @ (Asic::Bcm5784
+                | Asic::Bcm57765
+                | Asic::Bcm57766
+                | Asic::Bcm5717
+                | Asic::Bcm5719
+                | Asic::Bcm5720) => nvram_kind(asic, vendor) == Some(Nvram::Eeprom),
+                Asic::Bcm5761 => false, // Source pinstraps are buffered flash.
+            };
+            if eeprom {
+                self.flush(NVRAM_CFG1, config & !NVRAM_CFG1_COMPAT_BYPASS)?;
+                if self.identity.unwrap().asic == Asic::Bcm5762
+                    && self.read(NVRAM_CFG1)? != config & !NVRAM_CFG1_COMPAT_BYPASS
+                {
+                    return Err(Error::ConfigDidNotLatch);
+                }
+            }
+            Ok(config)
+        }
+        .await;
+        let disable = async {
+            let access = self.read(NVRAM_ACCESS)?;
+            self.flush(NVRAM_ACCESS, access & !ACCESS_ENABLE)
+        }
+        .await;
+        let result = self.combine(result, disable);
+        let release = self.flush(NVRAM_SWARB, SWARB_REQ_CLR1);
+        self.combine(result, release)
+    }
+    pub(super) async fn nvram_word(
+        &mut self,
+        offset: u32,
+        translate: bool,
+        page: u32,
+    ) -> Result<u32, Error> {
+        let address = if translate {
+            ((offset / page) << 9) + offset % page
+        } else {
+            offset
+        };
+        if address > NVRAM_ADDR_MSK || offset & 3 != 0 {
+            return Err(Error::Bounds);
+        }
+        self.nvram_lock().await?;
+        let result = async {
+            let access = self.read(NVRAM_ACCESS)?;
+            self.flush(NVRAM_ACCESS, access | ACCESS_ENABLE)?;
+            self.write(NVRAM_ADDR, address)?;
+            self.write(
+                NVRAM_CMD,
+                NVRAM_CMD_RD | NVRAM_CMD_GO | NVRAM_CMD_FIRST | NVRAM_CMD_LAST | NVRAM_CMD_DONE,
+            )?;
+            for _ in 0..10_000 {
+                self.wait(10).await?;
+                if self.read(NVRAM_CMD)? & NVRAM_CMD_DONE != 0 {
+                    self.wait(10).await?;
+                    // All-ones is legal NVRAM data; access errors remain errors.
+                    return self.regs().read32(NVRAM_RDDATA);
+                }
+            }
+            Err(Error::NvramTimeout)
+        }
+        .await;
+        let disable = async {
+            let access = self.read(NVRAM_ACCESS)?;
+            self.flush(NVRAM_ACCESS, access & !ACCESS_ENABLE)
+        }
+        .await;
+        let result = self.combine(result, disable);
+        let release = self.flush(NVRAM_SWARB, SWARB_REQ_CLR1);
+        self.combine(result, release)
+    }
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Nvram {
+    Eeprom,
+    Atmel,
+    St,
+}
+
+/// tg3_get_5787_nvram_info, tg3_get_57780_nvram_info, tg3_get_5717_nvram_info and
+/// tg3_get_5720_nvram_info's vendor pinstrap decode. The tables reuse codes
+/// for different parts.
+fn nvram_kind(asic: Asic, vendor: u32) -> Option<Nvram> {
+    Some(match (asic, vendor) {
+        (
+            Asic::Bcm5784,
+            FLASH_5787VENDOR_ATMEL_EEPROM_64KHZ
+            | FLASH_5787VENDOR_ATMEL_EEPROM_376KHZ
+            | FLASH_5787VENDOR_MICRO_EEPROM_64KHZ
+            | FLASH_5787VENDOR_MICRO_EEPROM_376KHZ,
+        ) => Nvram::Eeprom,
+        (
+            Asic::Bcm5784,
+            FLASH_5752VENDOR_ATMEL_FLASH_BUFFERED
+            | FLASH_5755VENDOR_ATMEL_FLASH_1
+            | FLASH_5755VENDOR_ATMEL_FLASH_2
+            | FLASH_5755VENDOR_ATMEL_FLASH_3,
+        ) => Nvram::Atmel,
+        (
+            Asic::Bcm5784,
+            FLASH_5752VENDOR_ST_M45PE10 | FLASH_5752VENDOR_ST_M45PE20 | FLASH_5752VENDOR_ST_M45PE40,
+        ) => Nvram::St,
+        (
+            Asic::Bcm57765 | Asic::Bcm57766,
+            FLASH_5787VENDOR_ATMEL_EEPROM_376KHZ | FLASH_5787VENDOR_MICRO_EEPROM_376KHZ,
+        ) => Nvram::Eeprom,
+        (
+            Asic::Bcm57765 | Asic::Bcm57766,
+            FLASH_5752VENDOR_ATMEL_FLASH_BUFFERED
+            | FLASH_57780VENDOR_ATMEL_AT45DB011D
+            | FLASH_57780VENDOR_ATMEL_AT45DB011B
+            | FLASH_57780VENDOR_ATMEL_AT45DB021D
+            | FLASH_57780VENDOR_ATMEL_AT45DB021B
+            | FLASH_57780VENDOR_ATMEL_AT45DB041D
+            | FLASH_57780VENDOR_ATMEL_AT45DB041B,
+        ) => Nvram::Atmel,
+        (
+            Asic::Bcm57765 | Asic::Bcm57766,
+            FLASH_5752VENDOR_ST_M45PE10 | FLASH_5752VENDOR_ST_M45PE20 | FLASH_5752VENDOR_ST_M45PE40,
+        ) => Nvram::St,
+        (
+            Asic::Bcm5717 | Asic::Bcm5719,
+            FLASH_5717VENDOR_ATMEL_EEPROM | FLASH_5717VENDOR_MICRO_EEPROM,
+        )
+        | (Asic::Bcm5720, FLASH_5720_EEPROM_HD | FLASH_5720_EEPROM_LD) => Nvram::Eeprom,
+        (
+            Asic::Bcm5717 | Asic::Bcm5719,
+            FLASH_5717VENDOR_ATMEL_MDB011D
+            | FLASH_5717VENDOR_ATMEL_ADB011B
+            | FLASH_5717VENDOR_ATMEL_ADB011D
+            | FLASH_5717VENDOR_ATMEL_MDB021D
+            | FLASH_5717VENDOR_ATMEL_ADB021B
+            | FLASH_5717VENDOR_ATMEL_ADB021D
+            | FLASH_5717VENDOR_ATMEL_45USPT,
+        )
+        | (
+            Asic::Bcm5720,
+            FLASH_5720VENDOR_M_ATMEL_DB011D
+            | FLASH_5720VENDOR_M_ATMEL_DB021D
+            | FLASH_5720VENDOR_M_ATMEL_DB041D
+            | FLASH_5720VENDOR_M_ATMEL_DB081D
+            | FLASH_5720VENDOR_A_ATMEL_DB011B
+            | FLASH_5720VENDOR_A_ATMEL_DB021B
+            | FLASH_5720VENDOR_A_ATMEL_DB041B
+            | FLASH_5720VENDOR_A_ATMEL_DB011D
+            | FLASH_5720VENDOR_A_ATMEL_DB021D
+            | FLASH_5720VENDOR_A_ATMEL_DB041D
+            | FLASH_5720VENDOR_A_ATMEL_DB081D
+            | FLASH_5720VENDOR_ATMEL_45USPT,
+        ) => Nvram::Atmel,
+        (
+            Asic::Bcm5717 | Asic::Bcm5719,
+            FLASH_5717VENDOR_ST_M_M25PE10
+            | FLASH_5717VENDOR_ST_A_M25PE10
+            | FLASH_5717VENDOR_ST_M_M45PE10
+            | FLASH_5717VENDOR_ST_A_M45PE10
+            | FLASH_5717VENDOR_ST_M_M25PE20
+            | FLASH_5717VENDOR_ST_A_M25PE20
+            | FLASH_5717VENDOR_ST_M_M45PE20
+            | FLASH_5717VENDOR_ST_A_M45PE20
+            | FLASH_5717VENDOR_ST_25USPT
+            | FLASH_5717VENDOR_ST_45USPT,
+        )
+        | (
+            Asic::Bcm5720,
+            FLASH_5720VENDOR_M_ST_M25PE10
+            | FLASH_5720VENDOR_M_ST_M25PE20
+            | FLASH_5720VENDOR_M_ST_M25PE40
+            | FLASH_5720VENDOR_M_ST_M25PE80
+            | FLASH_5720VENDOR_M_ST_M45PE10
+            | FLASH_5720VENDOR_M_ST_M45PE20
+            | FLASH_5720VENDOR_M_ST_M45PE40
+            | FLASH_5720VENDOR_M_ST_M45PE80
+            | FLASH_5720VENDOR_A_ST_M25PE10
+            | FLASH_5720VENDOR_A_ST_M25PE20
+            | FLASH_5720VENDOR_A_ST_M25PE40
+            | FLASH_5720VENDOR_A_ST_M25PE80
+            | FLASH_5720VENDOR_A_ST_M45PE10
+            | FLASH_5720VENDOR_A_ST_M45PE20
+            | FLASH_5720VENDOR_A_ST_M45PE40
+            | FLASH_5720VENDOR_A_ST_M45PE80
+            | FLASH_5720VENDOR_ST_25USPT
+            | FLASH_5720VENDOR_ST_45USPT,
+        ) => Nvram::St,
+        _ => return None,
+    })
+}
+
+pub(super) fn decode_mac(high: u32, low: u32) -> Mac {
+    Mac([
+        (high >> 8) as u8,
+        high as u8,
+        (low >> 24) as u8,
+        (low >> 16) as u8,
+        (low >> 8) as u8,
+        low as u8,
+    ])
+}
+pub(super) fn valid_mac(mac: Mac) -> bool {
+    mac.0 != [0; 6] && !mac.is_multicast()
+}
+/// A valid address other than the bare Broadcom OUI an unprogrammed part
+/// reports.
+pub(super) fn usable_mac(mac: Mac) -> bool {
+    valid_mac(mac) && mac != Mac([0, 0x10, 0x18, 0, 0, 0])
+}
+
+impl<R: Registers, D: Delay> Hardware<R, D> {
+    /// The end of `tg3_get_device_address` when neither the bootcode
+    /// mailbox nor NVRAM holds an address: the MAC address registers, then
+    /// a random address (`eth_hw_addr_random` in `tg3_init_one`).
+    /// The choice is kept for this epoch's later board reads.
+    pub(super) fn fallback_mac(&mut self) -> Result<Mac, Error> {
+        if let Some(mac) = self.fallback_mac {
+            return Ok(mac);
+        }
+        let mut mac = decode_mac(self.read(MAC_ADDR_0_HIGH)?, self.read(MAC_ADDR_0_LOW)?);
+        if !usable_mac(mac) {
+            let identity = self.identity.ok_or(Error::NotIdentified)?;
+            let [low, high] = identity.device.to_le_bytes();
+            mac = Mac::random(&[low, high, identity.bdf_function, identity.function]);
+        }
+        self.fallback_mac = Some(mac);
+        Ok(mac)
+    }
+}
+
+pub(super) fn decode_led(cfg2: u32) -> Result<u32, Error> {
+    Ok(
+        match cfg2 & (NIC_SRAM_DATA_CFG_LED_MODE_MASK | SHASTA_EXT_LED_MODE_MASK) {
+            NIC_SRAM_DATA_CFG_LED_MODE_PHY_1 => LED_CTRL_MODE_PHY_1,
+            NIC_SRAM_DATA_CFG_LED_MODE_PHY_2 => LED_CTRL_MODE_PHY_2,
+            NIC_SRAM_DATA_CFG_LED_MODE_MAC => LED_CTRL_MODE_MAC,
+            SHASTA_EXT_LED_SHARED => {
+                LED_CTRL_MODE_SHARED
+                    | LED_CTRL_MODE_PHY_1
+                    | LED_CTRL_MODE_PHY_2
+                    | LED_CTRL_BLINK_RATE_OVERRIDE
+                    | LED_CTRL_BLINK_RATE_MASK
+            }
+            SHASTA_EXT_LED_MAC => LED_CTRL_MODE_SHASTA_MAC,
+            SHASTA_EXT_LED_COMBO => LED_CTRL_MODE_COMBO | LED_CTRL_MODE_PHY_1 | LED_CTRL_MODE_PHY_2,
+            _ => return Err(Error::UnsupportedBoard),
+        },
+    )
+}

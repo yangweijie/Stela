@@ -1,0 +1,238 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 23:35:40 +0000
+Subject: [PATCH] fix(nouveau): a channel's MMU fault report judges the address
+ by the mappings when GSP-RM reported the fault and marks each history entry
+ before or after that report, where it judged by the mappings at the client's
+ next submission and called a range read after its unbind and mapped again
+ since lost page tables
+
+---
+ .../drm/nouveau/include/nvkm/engine/fifo.h    |  5 +-
+ drivers/gpu/drm/nouveau/nouveau_uvmm.c        | 91 ++++++++++++++-----
+ drivers/gpu/drm/nouveau/nouveau_uvmm.h        |  3 +-
+ .../nouveau/nvkm/subdev/gsp/rm/r570/fifo.c    |  1 +
+ 4 files changed, 74 insertions(+), 26 deletions(-)
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h b/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h
+index 690c1f9744a69cd52a2aee8639af5b6270e85b54..3e8528f731e2fc8827cb4b232556863c8cdad6f0 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/engine/fifo.h
+@@ -85,10 +85,13 @@ struct nvkm_fifo {
+ 	} rm;
+ 
+ 	/* The latest MMU fault that reset a channel, under lock, until the
+-	 * channel's client names what the address held.
++	 * channel's client names what the address held. The client does so
++	 * at its next submission, which may come long after: time is when
++	 * GSP-RM reported the fault, which the client's history is judged by.
+ 	 */
+ 	struct {
+ 		u64 addr;
++		ktime_t time;
+ 		u32 type;
+ 		int chid;
+ 		bool pending;
+diff --git a/drivers/gpu/drm/nouveau/nouveau_uvmm.c b/drivers/gpu/drm/nouveau/nouveau_uvmm.c
+index 307b0766ec8673cc78ac5a9cd18cf88d85135a8d..47db5a7762562424e5b900e1d65858fb21482492 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_uvmm.c
++++ b/drivers/gpu/drm/nouveau/nouveau_uvmm.c
+@@ -112,7 +112,7 @@ nouveau_uvmm_vmm_sparse_unref(struct nouveau_uvmm *uvmm,
+ /* Notes a page-table take, unmap or release for nouveau_uvmm_describe_fault(). */
+ static void
+ nouveau_uvmm_history_add(struct nouveau_uvmm *uvmm, u64 addr, u64 range,
+-			 u8 page_shift, const char *why)
++			 u8 page_shift, const char *why, bool take)
+ {
+ 	struct nouveau_uvmm_history *entry;
+ 
+@@ -120,9 +120,10 @@ nouveau_uvmm_history_add(struct nouveau_uvmm *uvmm, u64 addr, u64 range,
+ 	entry = &uvmm->history[uvmm->history_next++ % ARRAY_SIZE(uvmm->history)];
+ 	entry->addr = addr;
+ 	entry->range = range;
+-	entry->jiffies = jiffies;
++	entry->time = ktime_get();
+ 	entry->why = why;
+ 	entry->page_shift = page_shift;
++	entry->take = take;
+ 	spin_unlock(&uvmm->history_lock);
+ }
+ 
+@@ -133,7 +134,7 @@ nouveau_uvmm_vmm_get(struct nouveau_uvmm *uvmm,
+ 	struct nvif_vmm *vmm = &uvmm->vmm.vmm;
+ 
+ 	nouveau_uvmm_history_add(uvmm, addr, range, page_shift,
+-				 "page tables taken");
++				 "page tables taken", true);
+ 	return nvif_vmm_raw_get(vmm, addr, range, page_shift);
+ }
+ 
+@@ -144,7 +145,7 @@ nouveau_uvmm_vmm_put(struct nouveau_uvmm *uvmm,
+ 	struct nvif_vmm *vmm = &uvmm->vmm.vmm;
+ 
+ 	nouveau_uvmm_history_add(uvmm, addr, range, page_shift,
+-				 "page tables released");
++				 "page tables released", false);
+ 	return nvif_vmm_raw_put(vmm, addr, range, page_shift);
+ }
+ 
+@@ -155,7 +156,7 @@ nouveau_uvmm_vmm_unmap(struct nouveau_uvmm *uvmm,
+ {
+ 	struct nvif_vmm *vmm = &uvmm->vmm.vmm;
+ 
+-	nouveau_uvmm_history_add(uvmm, addr, range, page_shift, why);
++	nouveau_uvmm_history_add(uvmm, addr, range, page_shift, why, false);
+ 	return nvif_vmm_raw_unmap(vmm, addr, range, page_shift, sparse);
+ }
+ 
+@@ -1944,27 +1945,59 @@ nouveau_uvmm_describe_va(struct nouveau_cli *cli, const char *what,
+ 		  placement == TTM_PL_SYSTEM ? "system" : "none");
+ }
+ 
++/* Whether a mapping covered a faulting address when GSP-RM reported the
++ * fault, from the page-table takes, unmaps and releases that covered it,
++ * newest first in @found, and whether one covers it now. The newest entry
++ * at or before the report decides; with none, the oldest after it does: a
++ * take covering the address means none covered it then, an unmap or
++ * release that one did. With no entry, the mapping now held then too. The
++ * report trails the fault by GSP-RM's handling, so an entry in between
++ * counts as before it.
++ */
++static bool
++nouveau_uvmm_mapped_at_fault(const struct nouveau_uvmm_history *found,
++			     unsigned int shown, ktime_t at, bool covering)
++{
++	unsigned int i;
++
++	for (i = 0; i < shown; i++) {
++		if (ktime_compare(found[i].time, at) <= 0)
++			return found[i].take;
++	}
++	if (shown)
++		return !found[shown - 1].take;
++	return covering;
++}
++
+ /**
+  * nouveau_uvmm_describe_fault() - name what a channel's MMU fault address held
+  * @cli: the client whose channel @chid was reset
+  * @chid: the channel
+  *
+- * Once per fault GSP-RM reported with a channel reset: whether a mapping
+- * covers the address now (then the page tables lost it), the mappings either
+- * side, and the latest unmaps and page-table releases that covered it (then
+- * the address was used after it was unbound, moved or evicted). Runs in the
+- * client's ioctl, outside the hardware paths.
++ * Once per fault GSP-RM reported with a channel reset, at the client's next
++ * submission, which may come long after the fault: whether a mapping covered
++ * the address when the fault was reported (then the page tables lost it) or
++ * none did (then the address was used after it was unbound, moved or
++ * evicted, or before it was mapped), the mappings over it and either side
++ * now, and the latest page-table takes, unmaps and releases that covered it,
++ * each before or after the report. A mapping that covers the address now
++ * may have been made after the fault, in the range the faulting work read
++ * after it was unbound. Runs in the client's ioctl, outside the hardware
++ * paths.
+  */
+ void
+ nouveau_uvmm_describe_fault(struct nouveau_cli *cli, int chid)
+ {
+ 	struct nvkm_fifo *fifo = nvxx_device(cli->drm)->fifo;
+ 	struct nouveau_uvmm *uvmm = nouveau_cli_uvmm(cli);
+-	struct nouveau_uvmm_history found[4];
++	struct nouveau_uvmm_history found[6];
+ 	struct drm_gpuva *va, *below = NULL, *above = NULL, *covering = NULL;
+ 	struct nouveau_uvma_region *region;
+-	unsigned long flags, now = jiffies;
++	ktime_t now = ktime_get(), at;
+ 	unsigned int kept, i, shown = 0;
++	unsigned long flags;
++	const char *held;
++	bool mapped;
+ 	u64 addr;
+ 	u32 type;
+ 
+@@ -1978,6 +2011,7 @@ nouveau_uvmm_describe_fault(struct nouveau_cli *cli, int chid)
+ 	}
+ 	fifo->fault.pending = false;
+ 	addr = fifo->fault.addr;
++	at = fifo->fault.time;
+ 	type = fifo->fault.type;
+ 	spin_unlock_irqrestore(&fifo->lock, flags);
+ 
+@@ -2007,15 +2041,23 @@ nouveau_uvmm_describe_fault(struct nouveau_cli *cli, int chid)
+ 	}
+ 	region = nouveau_uvma_region_find_first(uvmm, addr, 1);
+ 
+-	NV_PRINTK(err, cli, "channel %d MMU fault at 0x%llx type %u: %s\n",
+-		  chid, addr, type,
+-		  covering && drm_gpuva_invalidated(covering) ?
+-			   "a mapping covers it, but its BO was moved or evicted" :
+-		  covering ? "a mapping covers it, so the page tables lost it" :
+-		  region ? "in a sparse region with no mapping" :
+-			   "no mapping covers it");
++	mapped = nouveau_uvmm_mapped_at_fault(found, shown, at, covering);
++	if (covering && drm_gpuva_invalidated(covering))
++		held = "a mapping covers it, but its BO was moved or evicted";
++	else if (mapped && covering)
++		held = "a mapping covered it at the fault, so the page tables lost it";
++	else if (mapped)
++		held = "a mapping covered it at the fault and was unbound since, so the page tables lost it";
++	else if (covering)
++		held = "no mapping covered it at the fault: the work read it unbound, and the mapping over it now was made after";
++	else if (region)
++		held = "in a sparse region with no mapping";
++	else
++		held = "no mapping covers it";
++	NV_PRINTK(err, cli, "channel %d MMU fault at 0x%llx type %u, reported %lld ms ago: %s\n",
++		  chid, addr, type, ktime_ms_delta(now, at), held);
+ 	if (covering)
+-		nouveau_uvmm_describe_va(cli, "covering", covering);
++		nouveau_uvmm_describe_va(cli, "covering now", covering);
+ 	if (below)
+ 		nouveau_uvmm_describe_va(cli, "below", below);
+ 	if (above)
+@@ -2023,10 +2065,11 @@ nouveau_uvmm_describe_fault(struct nouveau_cli *cli, int chid)
+ 	nouveau_uvmm_unlock(uvmm);
+ 
+ 	for (i = 0; i < shown; i++)
+-		NV_PRINTK(err, cli, "  %lu ms ago %s: 0x%llx-0x%llx page_shift %u\n",
+-			  (now - found[i].jiffies) * 1000 / HZ, found[i].why,
+-			  found[i].addr, found[i].addr + found[i].range,
+-			  found[i].page_shift);
++		NV_PRINTK(err, cli, "  %lld ms ago, %s the fault report, %s: 0x%llx-0x%llx page_shift %u\n",
++			  ktime_ms_delta(now, found[i].time),
++			  ktime_compare(found[i].time, at) <= 0 ? "before" : "after",
++			  found[i].why, found[i].addr,
++			  found[i].addr + found[i].range, found[i].page_shift);
+ 	if (!shown)
+ 		NV_PRINTK(err, cli, "  none of the latest %u page-table takes, unmaps or releases covered it\n",
+ 			  kept);
+diff --git a/drivers/gpu/drm/nouveau/nouveau_uvmm.h b/drivers/gpu/drm/nouveau/nouveau_uvmm.h
+index 486f180eea1072d080bce3fd2065e8544bafe615..d990fe4b92aa639fb11b8b0ab893659a3da40f00 100644
+--- a/drivers/gpu/drm/nouveau/nouveau_uvmm.h
++++ b/drivers/gpu/drm/nouveau/nouveau_uvmm.h
+@@ -22,9 +22,10 @@ struct nouveau_uvmm {
+ 	struct nouveau_uvmm_history {
+ 		u64 addr;
+ 		u64 range;
+-		unsigned long jiffies;
++		ktime_t time;
+ 		const char *why;
+ 		u8 page_shift;
++		bool take;
+ 	} history[128];
+ };
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/fifo.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/fifo.c
+index 00c134a631eea099ac7b49eac13f4663382813ec..1fc375513721618da65864af9c807f1a2347e39a 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/fifo.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r570/fifo.c
+@@ -116,6 +116,7 @@ r570_fifo_rc_triggered(void *priv, u32 fn, void *repv, u32 repc)
+ 
+ 		spin_lock_irqsave(&fifo->lock, flags);
+ 		fifo->fault.addr = (u64)msg->mmuFaultAddrHi << 32 | msg->mmuFaultAddrLo;
++		fifo->fault.time = ktime_get();
+ 		fifo->fault.type = msg->mmuFaultType;
+ 		fifo->fault.chid = msg->chid;
+ 		fifo->fault.pending = true;

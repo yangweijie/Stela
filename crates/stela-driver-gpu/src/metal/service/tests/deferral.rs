@@ -1,0 +1,746 @@
+//! Compilations deferred outside the service's turn: a call that needs one
+//! is answered `Pending` at once, other connections' calls are served while
+//! the job runs, and the call made again after it completes as before.
+extern crate std;
+
+use super::{
+    Memory, MockBackend, MockCompiler, Stream, TestService, connect, new_buffer, new_function,
+    new_library, service, service_on, submitted,
+};
+use crate::metal::{
+    abi::{DispatchType, StorageMode},
+    service::{
+        GuestMemory, Served, ServiceHost, SharedService,
+        wire::{
+            self, ComputePipelineResponse, Empty, GateCall, NewComputePipelineRequest, Operation,
+            Record, Span, Status, Value,
+            commands::{
+                BeginCompute, CommitRequest, ComputeCode, Dispatch, SetBuffer, SetPipeline,
+            },
+        },
+    },
+    vulkan::command::Command,
+};
+use alloc::{sync::Arc, vec};
+use core::{
+    mem::size_of,
+    num::NonZeroU64,
+    sync::atomic::{AtomicBool, AtomicU64, Ordering},
+};
+use std::time::{Duration, Instant};
+use stela_contracts::gate::GateService;
+
+/// Nanoseconds since the first tick.
+fn ticks() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+}
+
+/// The longest any commit held the service, and the calls answered
+/// `Pending`, for the one test whose host records them.
+static COMPILER_HELD: AtomicU64 = AtomicU64::new(0);
+static COMPILER_PENDING: AtomicU64 = AtomicU64::new(0);
+static BACKEND_HELD: AtomicU64 = AtomicU64::new(0);
+static BACKEND_PENDING: AtomicU64 = AtomicU64::new(0);
+
+const fn host(served: fn(Served)) -> ServiceHost {
+    ServiceHost {
+        relax: core::hint::spin_loop,
+        relax_within: || {
+            core::hint::spin_loop();
+            true
+        },
+        stack: 1,
+        run: |_, call| call(),
+        report: |_| {},
+        note: |_| {},
+        ticks,
+        served,
+        wake: || {},
+        bundle: |_| {},
+        job_waiting: || {},
+    }
+}
+
+fn count(held: &AtomicU64, pending: &AtomicU64, served: Served) {
+    if served.operation == Operation::Commit.raw() {
+        held.fetch_max(served.held, Ordering::Relaxed);
+        if served.status == Status::Pending {
+            pending.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+}
+
+/// A commit's record in `memory` that dispatches `pipeline` over `buffer`.
+fn dispatching(memory: &mut Memory, pipeline: u64, buffer: u64) -> u64 {
+    let mut stream = Stream::default();
+    stream
+        .push(
+            ComputeCode::Begin.raw(),
+            &BeginCompute {
+                dispatch_type: DispatchType::Serial.raw(),
+            },
+            &[],
+        )
+        .push(
+            ComputeCode::SetPipeline.raw(),
+            &SetPipeline { pipeline },
+            &[],
+        )
+        .push(
+            ComputeCode::SetBuffer.raw(),
+            &SetBuffer {
+                buffer,
+                offset: 0,
+                index: 0,
+            },
+            &[],
+        )
+        .push(
+            ComputeCode::DispatchThreadgroups.raw(),
+            &Dispatch {
+                size: [4, 1, 1],
+                threads: [32, 1, 1],
+            },
+            &[],
+        )
+        .end();
+    let request = CommitRequest {
+        commands: memory.put(&stream.0),
+        queue: 1,
+    };
+    gate_call(memory, Operation::Commit, &request, size_of::<Value>())
+}
+
+fn gate_call<Q: Record>(
+    memory: &mut Memory,
+    operation: Operation,
+    request: &Q,
+    response: usize,
+) -> u64 {
+    let mut bytes = vec![0; size_of::<Q>()];
+    wire::write(request, &mut bytes).unwrap();
+    let call = GateCall {
+        operation: operation.raw(),
+        status: u32::MAX,
+        request: memory.put(&bytes),
+        response: memory.put(&vec![0; response]),
+        reason: memory.put(&[0; 64]),
+        reason_length: 0,
+    };
+    memory.records(&[call]).address
+}
+
+fn status(memory: &mut Memory, record: u64) -> Status {
+    let span = Span {
+        address: record,
+        length: size_of::<GateCall>() as u64,
+    };
+    let call: GateCall = wire::read(&GuestMemory::read(memory, span).unwrap()).unwrap();
+    Status::from_raw(call.status).unwrap()
+}
+
+/// A connection's compute pipeline and buffer, made before the service is
+/// shared.
+fn pipeline(service: &mut TestService, connection: NonZeroU64) -> (u64, u64) {
+    let memory = &mut Memory::default();
+    let library = new_library(service, connection, memory);
+    let kernel = new_function(service, connection, library, "kernel", &[], memory)
+        .unwrap()
+        .handle;
+    let request = NewComputePipelineRequest {
+        compute_function: kernel,
+        ..Default::default()
+    };
+    let pipeline: ComputePipelineResponse = super::call(
+        service,
+        connection,
+        Operation::NewComputePipeline,
+        &request,
+        memory,
+    )
+    .unwrap();
+    (
+        pipeline.handle,
+        new_buffer(service, connection, StorageMode::Shared),
+    )
+}
+
+/// Connection A commits a dispatch whose variant `defer` makes wait on
+/// `gate`; B commits and polls while A's job runs. Returns the shared
+/// service and A's commit, done.
+fn run_deferred(
+    mut service: TestService,
+    defer: impl FnOnce(&mut TestService, Arc<AtomicBool>),
+    served: fn(Served),
+) -> (Arc<SharedService<MockBackend, MockCompiler>>, usize) {
+    let (a, b) = (connect(&mut service), connect(&mut service));
+    let (pipeline_a, buffer_a) = pipeline(&mut service, a);
+    let (pipeline_b, buffer_b) = pipeline(&mut service, b);
+    // B's dispatch shape compiles in its turn before A's defers.
+    let mut memory_b = Memory::default();
+    let commit_b = dispatching(&mut memory_b, pipeline_b, buffer_b);
+    let gate = Arc::new(AtomicBool::new(false));
+    defer(&mut service, gate.clone());
+    let shared = Arc::new(SharedService::new(service, host(served)));
+    shared.set_compile_stack(1);
+
+    // A's commit needs the job: answered at once, nothing submitted.
+    let mut memory_a = Memory::default();
+    let commit_a = dispatching(&mut memory_a, pipeline_a, buffer_a);
+    shared
+        .serve(a, commit_a, &mut memory_a)
+        .expect("the record is in reach");
+    assert_eq!(status(&mut memory_a, commit_a), Status::Pending);
+    assert!(shared.jobs_waiting());
+
+    // A processor whose guest waits runs the job, which blocks.
+    let runner = {
+        let shared = shared.clone();
+        std::thread::spawn(move || shared.run_job(0, 0).is_some())
+    };
+    while shared.jobs_waiting() {
+        std::thread::yield_now();
+    }
+    // Meanwhile B commits and polls, and A asks again without a turn.
+    shared.serve(b, commit_b, &mut memory_b).unwrap();
+    assert_eq!(status(&mut memory_b, commit_b), Status::Ok);
+    let poll = gate_call(
+        &mut memory_b,
+        Operation::Poll,
+        &Empty {},
+        size_of::<crate::metal::service::wire::PollResponse>(),
+    );
+    shared.serve(b, poll, &mut memory_b).unwrap();
+    assert_eq!(status(&mut memory_b, poll), Status::Ok);
+    shared.serve(a, commit_a, &mut memory_a).unwrap();
+    assert_eq!(status(&mut memory_a, commit_a), Status::Pending);
+    assert_eq!(shared.take_job_report().repeated, 1);
+    assert!(!runner.is_finished());
+
+    // Released, the job ends, and A's commit runs whole once.
+    std::thread::sleep(Duration::from_millis(20));
+    gate.store(true, Ordering::Release);
+    assert!(runner.join().unwrap());
+    let before = submissions(&shared);
+    shared.serve(a, commit_a, &mut memory_a).unwrap();
+    assert_eq!(status(&mut memory_a, commit_a), Status::Ok);
+    (shared, before)
+}
+
+fn submissions(shared: &SharedService<MockBackend, MockCompiler>) -> usize {
+    let mut turn = shared.try_turn().unwrap();
+    turn.device().backend().submissions.len()
+}
+
+/// The bound a commit's turn stays under while its compilation blocks for
+/// longer: the job ran outside the turn.
+const HELD_BOUND: u64 = 10_000_000;
+
+#[test]
+fn a_commit_whose_variant_compiles_waits_outside_the_turn() {
+    let (shared, before) = run_deferred(
+        service(),
+        |service, gate| {
+            let compiler = service.device().compiler_mut();
+            compiler.defer_next = true;
+            compiler.job_gate = Some(gate);
+        },
+        |served| count(&COMPILER_HELD, &COMPILER_PENDING, served),
+    );
+    let held = COMPILER_HELD.load(Ordering::Relaxed);
+    assert!(held < HELD_BOUND, "a commit held the service {held} ns");
+    assert_eq!(COMPILER_PENDING.load(Ordering::Relaxed), 2);
+    let report = shared.take_job_report();
+    assert!(report.longest >= 20_000_000, "the job blocked {report:?}");
+    // A's last run submitted its dispatch once; its deferred runs nothing.
+    assert_eq!(submissions(&shared), before + 1);
+    let mut turn = shared.try_turn().unwrap();
+    assert_eq!(turn.device().compiler_mut().adopted, 1);
+    assert!(submitted(&mut turn).contains(&Command::Dispatch([4, 1, 1])));
+}
+
+#[test]
+fn a_commit_whose_pipeline_creation_compiles_waits_outside_the_turn() {
+    let (shared, before) = run_deferred(
+        service_on(MockBackend::new()),
+        |service, gate| service.device().backend().pipeline_gate = Some(gate),
+        |served| count(&BACKEND_HELD, &BACKEND_PENDING, served),
+    );
+    let held = BACKEND_HELD.load(Ordering::Relaxed);
+    assert!(held < HELD_BOUND, "a commit held the service {held} ns");
+    assert_eq!(BACKEND_PENDING.load(Ordering::Relaxed), 2);
+    assert_eq!(submissions(&shared), before + 1);
+    let mut turn = shared.try_turn().unwrap();
+    assert_eq!(turn.device().backend().adopted, 1);
+    assert!(submitted(&mut turn).contains(&Command::Dispatch([4, 1, 1])));
+}
+
+/// A commit that misses two pipelines leaves a job for each in one turn and
+/// runs again once, rather than replaying its stream once for each.
+#[test]
+fn a_commit_that_misses_two_pipelines_leaves_both_jobs_in_one_turn() {
+    let mut service = service_on(MockBackend::new());
+    let a = connect(&mut service);
+    let (first, buffer) = pipeline(&mut service, a);
+    let (second, _) = pipeline(&mut service, a);
+    service.device().backend().deferred_pipelines = 2;
+    let shared = SharedService::new(service, host(|_| {}));
+    shared.set_compile_stack(1);
+    let mut memory = Memory::default();
+    let mut stream = Stream::default();
+    stream.push(
+        ComputeCode::Begin.raw(),
+        &BeginCompute {
+            dispatch_type: DispatchType::Serial.raw(),
+        },
+        &[],
+    );
+    for (pipeline, width) in [(first, 4), (second, 8)] {
+        stream
+            .push(
+                ComputeCode::SetPipeline.raw(),
+                &SetPipeline { pipeline },
+                &[],
+            )
+            .push(
+                ComputeCode::SetBuffer.raw(),
+                &SetBuffer {
+                    buffer,
+                    offset: 0,
+                    index: 0,
+                },
+                &[],
+            )
+            .push(
+                ComputeCode::DispatchThreadgroups.raw(),
+                &Dispatch {
+                    size: [width, 1, 1],
+                    threads: [32, 1, 1],
+                },
+                &[],
+            );
+    }
+    stream.end();
+    let request = CommitRequest {
+        commands: memory.put(&stream.0),
+        queue: 1,
+    };
+    let commit = gate_call(&mut memory, Operation::Commit, &request, size_of::<Value>());
+    shared.serve(a, commit, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, commit), Status::Pending);
+    // Parked on the job that runs last: asked again after the first, the
+    // call is still answered without a turn.
+    assert!(shared.run_job(0, 0).is_some());
+    shared.serve(a, commit, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, commit), Status::Pending);
+    assert!(shared.run_job(0, 0).is_some());
+    assert!(shared.run_job(0, 0).is_none());
+    shared.serve(a, commit, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, commit), Status::Ok);
+    let report = shared.take_job_report();
+    assert_eq!((report.ran, report.deferred, report.repeated), (2, 1, 1));
+    let mut turn = shared.try_turn().unwrap();
+    assert_eq!(turn.device().backend().adopted, 2);
+    let submitted = submitted(&mut turn);
+    assert!(submitted.contains(&Command::Dispatch([4, 1, 1])));
+    assert!(submitted.contains(&Command::Dispatch([8, 1, 1])));
+}
+
+/// A new texture whose kernel memory Linux makes slowly holds no turn while
+/// it is made: the call is answered `Pending` at once, another connection's
+/// texture is created while the job blocks, and the call's next run takes
+/// what the job made.
+#[test]
+fn a_texture_whose_memory_a_job_makes_holds_no_turn_meanwhile() {
+    use crate::metal::service::wire::TextureResponse;
+    let mut service = service_on(MockBackend::new());
+    let (a, b) = (connect(&mut service), connect(&mut service));
+    let gate = Arc::new(AtomicBool::new(false));
+    service.device().backend().image_gate = Some(gate.clone());
+    let shared = Arc::new(SharedService::new(service, host(|_| {})));
+    shared.set_compile_stack(1);
+    let new_texture = |memory: &mut Memory| {
+        gate_call(
+            memory,
+            Operation::NewTexture,
+            &super::texture(StorageMode::Private),
+            size_of::<TextureResponse>(),
+        )
+    };
+    let mut memory_a = Memory::default();
+    let texture_a = new_texture(&mut memory_a);
+    shared.serve(a, texture_a, &mut memory_a).unwrap();
+    assert_eq!(status(&mut memory_a, texture_a), Status::Pending);
+    let runner = {
+        let shared = shared.clone();
+        std::thread::spawn(move || shared.run_job(0, 0).is_some())
+    };
+    while shared.jobs_waiting() {
+        std::thread::yield_now();
+    }
+    // While the job waits, B's texture takes a turn of its own, and A,
+    // asking again, is answered without one.
+    let mut memory_b = Memory::default();
+    let texture_b = new_texture(&mut memory_b);
+    shared.serve(b, texture_b, &mut memory_b).unwrap();
+    assert_eq!(status(&mut memory_b, texture_b), Status::Ok);
+    shared.serve(a, texture_a, &mut memory_a).unwrap();
+    assert_eq!(status(&mut memory_a, texture_a), Status::Pending);
+    assert!(!runner.is_finished());
+    gate.store(true, Ordering::Release);
+    assert!(runner.join().unwrap());
+    shared.serve(a, texture_a, &mut memory_a).unwrap();
+    assert_eq!(status(&mut memory_a, texture_a), Status::Ok);
+    let mut turn = shared.try_turn().unwrap();
+    assert_eq!(turn.device().backend().adopted, 1);
+}
+
+#[test]
+fn a_job_never_runs_inside_its_callers_call_however_long_it_waits() {
+    let mut service = service();
+    let a = connect(&mut service);
+    let (pipeline, buffer) = pipeline(&mut service, a);
+    let compiler = service.device().compiler_mut();
+    compiler.defer_next = true;
+    compiler.job_gate = Some(Arc::new(AtomicBool::new(true)));
+    let shared = SharedService::new(service, host(|_| {}));
+    shared.set_compile_stack(1);
+    let mut memory = Memory::default();
+    let commit = dispatching(&mut memory, pipeline, buffer);
+    shared.serve(a, commit, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, commit), Status::Pending);
+    // Every processor is busy: the call is asked again and again, long
+    // after it was deferred, and stays a short `Pending` answer.
+    for _ in 0..3 {
+        std::thread::sleep(Duration::from_millis(2));
+        shared.serve(a, commit, &mut memory).unwrap();
+        assert_eq!(status(&mut memory, commit), Status::Pending);
+    }
+    assert_eq!(shared.take_job_report().ran, 0);
+    assert!(shared.jobs_waiting());
+    // Host work between guest slices runs it; the call then completes.
+    assert!(shared.run_job(0, 0).is_some());
+    shared.serve(a, commit, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, commit), Status::Ok);
+    let report = shared.take_job_report();
+    assert_eq!((report.ran, report.repeated), (1, 0));
+    assert!(!shared.jobs_waiting());
+}
+
+/// A deferred call's run writes nothing, so a record that cannot take its
+/// `Pending` is untouched: the call fails with the caller's fault for the
+/// gate to report, never as served, and leaves no job.
+#[test]
+fn a_deferred_call_whose_record_takes_no_pending_fails_with_the_fault() {
+    use stela_contracts::gate::{CallerFault, CallerMemory};
+    struct DenyRecord<'a> {
+        memory: &'a mut Memory,
+        record: u64,
+    }
+    impl CallerMemory for DenyRecord<'_> {
+        fn read(&mut self, address: u64, buffer: &mut [u8]) -> Result<(), CallerFault> {
+            CallerMemory::read(self.memory, address, buffer)
+        }
+
+        fn write(&mut self, address: u64, data: &[u8]) -> Result<(), CallerFault> {
+            if address == self.record {
+                return Err(CallerFault::Denied { address });
+            }
+            CallerMemory::write(self.memory, address, data)
+        }
+    }
+
+    let mut service = service();
+    let a = connect(&mut service);
+    let (pipeline, buffer) = pipeline(&mut service, a);
+    service.device().compiler_mut().defer_next = true;
+    let shared = SharedService::new(service, host(|_| {}));
+    shared.set_compile_stack(1);
+    let mut memory = Memory::default();
+    let commit = dispatching(&mut memory, pipeline, buffer);
+    let mut caller = DenyRecord {
+        memory: &mut memory,
+        record: commit,
+    };
+    assert_eq!(
+        shared.serve(a, commit, &mut caller),
+        Err(CallerFault::Denied { address: commit })
+    );
+    // Untouched: the status the caller wrote is still there.
+    let span = Span {
+        address: commit,
+        length: size_of::<GateCall>() as u64,
+    };
+    let call: GateCall = wire::read(&GuestMemory::read(&mut memory, span).unwrap()).unwrap();
+    assert_eq!(call.status, u32::MAX);
+    assert!(!shared.jobs_waiting());
+}
+
+/// A job run in slices on a thread of its own, as a platform runs one on its
+/// compile stack: [`threaded::pause`] gives the processor back, and the next
+/// `resume` runs the job on.
+mod threaded {
+    extern crate std;
+
+    use crate::metal::deferred::Sliced;
+    use alloc::boxed::Box;
+    use std::{
+        cell::RefCell,
+        sync::mpsc::{Receiver, Sender, channel},
+    };
+
+    std::thread_local! {
+        static BACK: RefCell<Option<(Receiver<()>, Sender<bool>)>> = const { RefCell::new(None) };
+    }
+
+    /// Ends the slice the job runs in.
+    pub(super) fn pause() {
+        BACK.with(|back| {
+            if let Some((go, ended)) = &*back.borrow() {
+                ended.send(false).unwrap();
+                go.recv().unwrap();
+            }
+        });
+    }
+
+    struct Threaded {
+        go: Sender<()>,
+        ended: Receiver<bool>,
+    }
+
+    impl Sliced for Threaded {
+        fn resume(&mut self) -> bool {
+            self.go.send(()).unwrap();
+            self.ended.recv().unwrap()
+        }
+    }
+
+    pub(super) fn start(_stack: u64, body: Box<dyn FnOnce() + Send>) -> Box<dyn Sliced> {
+        let (go, go_job) = channel();
+        let (ended_job, ended) = channel();
+        std::thread::spawn(move || {
+            go_job.recv().unwrap();
+            let finished = ended_job.clone();
+            BACK.with(|back| *back.borrow_mut() = Some((go_job, ended_job)));
+            body();
+            finished.send(true).unwrap();
+        });
+        Box::new(Threaded { go, ended })
+    }
+}
+
+/// A long compilation runs as bounded host steps: each `run_job` runs one
+/// slice and gives the processor back, the call stays a short `Pending`
+/// answer between slices, no taker that must wait resumes it early, and the
+/// call completes once the last slice ran, as with a job run whole.
+#[test]
+fn a_long_job_runs_in_bounded_slices_and_its_call_completes_as_before() {
+    let mut service = service();
+    let a = connect(&mut service);
+    let (pipeline, buffer) = pipeline(&mut service, a);
+    let compiler = service.device().compiler_mut();
+    compiler.defer_next = true;
+    compiler.job_steps = Some((5, threaded::pause));
+    let shared = SharedService::new(service, host(|_| {}));
+    shared.set_compile_stack(1);
+    shared.set_job_slicer(threaded::start);
+    let mut memory = Memory::default();
+    let commit = dispatching(&mut memory, pipeline, buffer);
+    shared.serve(a, commit, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, commit), Status::Pending);
+    // A wait that only resumes starts nothing.
+    assert_eq!(shared.run_job(u64::MAX, 0), None);
+    let first = shared.run_job(0, 0).expect("the job starts");
+    assert_eq!((first.started, first.finished), (true, false));
+    for _ in 0..4 {
+        assert!(shared.job_between_slices());
+        shared.serve(a, commit, &mut memory).unwrap();
+        assert_eq!(status(&mut memory, commit), Status::Pending);
+        // The boot processor leaves a job another resumes.
+        assert_eq!(shared.run_job(0, u64::MAX), None);
+        let slice = shared.run_job(u64::MAX, 0).expect("a wait resumes it");
+        assert_eq!((slice.started, slice.finished), (false, false));
+    }
+    let last = shared.run_job(0, 0).expect("the job ends");
+    assert_eq!((last.started, last.finished), (false, true));
+    assert!(!shared.jobs_waiting());
+    assert_eq!(shared.run_job(0, 0), None);
+    shared.serve(a, commit, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, commit), Status::Ok);
+    let report = shared.take_job_report();
+    assert_eq!((report.ran, report.slices), (1, 6));
+    assert!(report.longest_slice <= report.longest);
+    let mut turn = shared.try_turn().unwrap();
+    assert_eq!(turn.device().compiler_mut().adopted, 1);
+    assert!(submitted(&mut turn).contains(&Command::Dispatch([4, 1, 1])));
+}
+
+/// The test's shared service, which the mock's withdrawn allocation tells
+/// as the platform's withdrawal of a host call does.
+static WITHDRAWING: std::sync::Mutex<
+    Option<std::sync::Weak<SharedService<MockBackend, MockCompiler>>>,
+> = std::sync::Mutex::new(None);
+
+fn withdraw() -> bool {
+    WITHDRAWING
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(std::sync::Weak::upgrade)
+        .is_some_and(|shared| shared.defer_for_wait())
+}
+
+/// A host call no task took in time is withdrawn, and the driver fails the
+/// allocation behind it. A call that may be made again is answered
+/// `Pending` and completes when made again, instead of failing with out of
+/// memory for what was only a wait; one that cannot keeps the failure.
+#[test]
+fn a_call_whose_host_call_no_task_took_runs_again_instead_of_failing() {
+    use crate::metal::service::wire::{BufferResponse, NewBufferRequest, TextureResponse};
+    let mut service = service_on(MockBackend::new());
+    let a = connect(&mut service);
+    service.device().backend().withdrawn_allocation = Some(withdraw);
+    let shared = Arc::new(SharedService::new(service, host(|_| {})));
+    shared.set_compile_stack(1);
+    *WITHDRAWING.lock().unwrap() = Some(Arc::downgrade(&shared));
+    let mut memory = Memory::default();
+    let texture = gate_call(
+        &mut memory,
+        Operation::NewTexture,
+        &super::texture(StorageMode::Private),
+        size_of::<TextureResponse>(),
+    );
+    shared.serve(a, texture, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, texture), Status::Pending);
+    shared.serve(a, texture, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, texture), Status::Pending);
+    assert!(shared.run_job(0, 0).is_some());
+    shared.serve(a, texture, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, texture), Status::Ok);
+    assert!(!shared.jobs_waiting());
+
+    // A new buffer is never made again: its failure stays the answer.
+    shared
+        .try_turn()
+        .unwrap()
+        .device()
+        .backend()
+        .withdrawn_allocation = Some(withdraw);
+    let buffer = gate_call(
+        &mut memory,
+        Operation::NewBuffer,
+        &NewBufferRequest {
+            length: 64 << 20,
+            options: super::options(StorageMode::Private),
+        },
+        size_of::<BufferResponse>(),
+    );
+    shared.serve(a, buffer, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, buffer), Status::OutOfMemory);
+    assert!(!shared.jobs_waiting());
+    *WITHDRAWING.lock().unwrap() = None;
+}
+
+/// The report says how long a parked call waited for its job: from its
+/// first `Pending` to the run that found the job done, with the job's own
+/// wait in the queue.
+#[test]
+fn the_job_report_says_how_long_a_parked_call_waited_for_its_job() {
+    use crate::metal::service::wire::TextureResponse;
+    let mut service = service_on(MockBackend::new());
+    let a = connect(&mut service);
+    let gate = Arc::new(AtomicBool::new(false));
+    service.device().backend().image_gate = Some(gate.clone());
+    let shared = Arc::new(SharedService::new(service, host(|_| {})));
+    shared.set_compile_stack(1);
+    let mut memory = Memory::default();
+    let texture = gate_call(
+        &mut memory,
+        Operation::NewTexture,
+        &super::texture(StorageMode::Private),
+        size_of::<TextureResponse>(),
+    );
+    shared.serve(a, texture, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, texture), Status::Pending);
+    std::thread::sleep(Duration::from_millis(1));
+    let runner = {
+        let shared = shared.clone();
+        std::thread::spawn(move || shared.run_job(0, 0).is_some())
+    };
+    // The job runs, held by its gate, for at least 2 ms.
+    while shared.jobs_waiting() {
+        std::thread::yield_now();
+    }
+    std::thread::sleep(Duration::from_millis(2));
+    gate.store(true, Ordering::Release);
+    assert!(runner.join().unwrap());
+    shared.serve(a, texture, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, texture), Status::Ok);
+    let report = shared.take_job_report();
+    assert_eq!((report.ran, report.deferred, report.resumed), (1, 1, 1));
+    assert!(report.queued >= 1_000_000, "{report:?}");
+    assert!(
+        report.resumed_after >= report.queued + 2_000_000,
+        "{report:?}"
+    );
+    assert_eq!(report.longest_resumed_after, report.resumed_after);
+    assert_eq!(report.longest_queued, report.queued);
+}
+
+/// Calls of `job_waiting` the next test's host saw.
+static JOB_WAITING: AtomicU64 = AtomicU64::new(0);
+
+/// A call that parks on a job no processor started tells the platform, and
+/// so does each run of it while the job stays queued, so that an idle
+/// processor can be called to start it; once a processor took the job,
+/// nobody is told.
+#[test]
+fn a_call_waiting_for_an_unstarted_job_tells_the_platform() {
+    use crate::metal::service::wire::TextureResponse;
+    let mut service = service_on(MockBackend::new());
+    let a = connect(&mut service);
+    let gate = Arc::new(AtomicBool::new(false));
+    service.device().backend().image_gate = Some(gate.clone());
+    let shared = Arc::new(SharedService::new(
+        service,
+        ServiceHost {
+            job_waiting: || {
+                JOB_WAITING.fetch_add(1, Ordering::SeqCst);
+            },
+            ..host(|_| {})
+        },
+    ));
+    shared.set_compile_stack(1);
+    let mut memory = Memory::default();
+    let texture = gate_call(
+        &mut memory,
+        Operation::NewTexture,
+        &super::texture(StorageMode::Private),
+        size_of::<TextureResponse>(),
+    );
+    shared.serve(a, texture, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, texture), Status::Pending);
+    assert!(shared.job_queued());
+    assert_eq!(JOB_WAITING.load(Ordering::SeqCst), 1, "told when it parks");
+    shared.serve(a, texture, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, texture), Status::Pending);
+    assert_eq!(JOB_WAITING.load(Ordering::SeqCst), 2, "and when made again");
+    // A processor took the job: made again, the call waits without a word.
+    let runner = {
+        let shared = shared.clone();
+        std::thread::spawn(move || shared.run_job(0, 0).is_some())
+    };
+    while shared.job_queued() {
+        std::thread::yield_now();
+    }
+    shared.serve(a, texture, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, texture), Status::Pending);
+    gate.store(true, Ordering::Release);
+    assert!(runner.join().unwrap());
+    shared.serve(a, texture, &mut memory).unwrap();
+    assert_eq!(status(&mut memory, texture), Status::Ok);
+    assert_eq!(JOB_WAITING.load(Ordering::SeqCst), 2);
+    let report = shared.take_job_report();
+    assert_eq!((report.ran, report.deferred, report.repeated), (1, 1, 2));
+}

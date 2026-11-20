@@ -1,0 +1,314 @@
+//! Mach-O loading: slice selection, load plans, chained fixups, exports,
+//! plus the restore-image formats
+//! the kernel boot hand-off consumes.
+//!
+//! Without the default `std` feature only the kernel boot-bundle builder and
+//! the formats it reads are built, so `stela.efi` can prepare a bundle.
+#![cfg_attr(not(feature = "std"), no_std)]
+extern crate alloc;
+
+mod error;
+pub use error::{Error, Result, Within};
+#[cfg(feature = "std")]
+use stela_contracts::{refuse, require};
+
+pub mod aic;
+pub mod apple_device_tree;
+pub mod aux_kc;
+pub mod boot_args;
+pub mod boot_bundle;
+pub mod boot_manifests;
+pub mod boot_policy;
+pub mod boot_selection;
+pub mod boot_trace;
+pub mod carveouts;
+#[cfg(feature = "std")]
+pub mod chained_fixups;
+pub mod coprocessor;
+#[cfg(feature = "std")]
+pub use stela_formats::code_signature;
+pub mod darts;
+pub mod devices;
+pub mod dvfs;
+#[cfg(feature = "std")]
+pub mod exports;
+pub mod firmware_boot;
+pub mod gpu_dvfs;
+pub mod handoff;
+pub mod host_firmware;
+pub mod im4m;
+pub mod im4p;
+pub mod installed;
+pub mod kernel_collection;
+pub mod kernel_version;
+#[cfg(feature = "std")]
+pub mod load_plan;
+pub mod local_policy;
+pub mod lock_regs;
+pub mod mount_interface;
+pub mod nvram;
+#[cfg(feature = "std")]
+pub mod plugin;
+pub mod recovery;
+pub mod root_selection;
+pub mod soc_variant;
+pub mod stela_gpu;
+mod thread_state;
+pub mod trust_cache;
+pub mod upgrade;
+#[cfg(feature = "std")]
+use object::{Object, ObjectSection};
+#[cfg(feature = "std")]
+use std::borrow::Cow;
+#[cfg(feature = "std")]
+use stela_formats::sha256;
+
+/// One Mach-O slice of a file, as [`inspect`] names it.
+#[cfg(feature = "std")]
+#[derive(Debug, Clone)]
+pub struct Artifact {
+    /// Identity includes path, fat-slice offset, and source hash.
+    pub id: String,
+    pub path: String,
+    pub sha256: String,
+    pub architecture: String,
+    pub slice_offset: u64,
+    pub text_bytes: u64,
+}
+
+#[cfg(feature = "std")]
+fn slice(data: &[u8], offset: u64, size: u64) -> Result<&[u8]> {
+    let start = offset as usize;
+    let end = offset
+        .checked_add(size)
+        .ok_or(refuse!("slice range overflow"))? as usize;
+    data.get(start..end)
+        .ok_or(refuse!("Mach-O slice is out of bounds").into())
+}
+
+#[cfg(feature = "std")]
+fn integer(data: &[u8], start: usize, width: usize, little: bool) -> Result<u64> {
+    let bytes = data
+        .get(start..start + width)
+        .ok_or(refuse!("truncated fat header"))?;
+    let mut padded = [0u8; 8];
+    if little {
+        padded[..width].copy_from_slice(bytes);
+        Ok(u64::from_le_bytes(padded))
+    } else {
+        padded[8 - width..].copy_from_slice(bytes);
+        Ok(u64::from_be_bytes(padded))
+    }
+}
+
+#[cfg(feature = "std")]
+fn parsed_macho(data: &[u8]) -> Result<object::File<'_>> {
+    let file = object::File::parse(data)?;
+    require!(
+        file.format() == object::BinaryFormat::MachO,
+        "not a Mach-O slice"
+    );
+    Ok(file)
+}
+
+#[cfg(feature = "std")]
+fn architecture(file: &object::File<'_>, data: &[u8]) -> Result<Cow<'static, str>> {
+    Ok(match file.architecture() {
+        object::Architecture::Aarch64 => {
+            // cpu_subtype's high byte contains capability flags.
+            let subtype = integer(data, 8, 4, file.is_little_endian())? as u32 & 0x00ff_ffff;
+            match subtype {
+                0 => Cow::Borrowed("arm64"),
+                2 => Cow::Borrowed("arm64e"),
+                // LLVM MachO.h 4a0a7e3ddc3b: CPU_SUBTYPE_ARM64E_X1.
+                // Naming this slice does not admit it to the execution profile.
+                12 => Cow::Borrowed("arm64e.x1"),
+                other => Cow::Owned(format!("arm64-subtype-{other}")),
+            }
+        }
+        object::Architecture::X86_64 => Cow::Borrowed("x86_64"),
+        other => Cow::Owned(format!("{other:?}")),
+    })
+}
+
+#[cfg(feature = "std")]
+fn artifact(data: &[u8], path: &str, offset: u64) -> Result<Artifact> {
+    let file = parsed_macho(data)?;
+    let architecture = architecture(&file, data)?.into_owned();
+    let text_bytes = file
+        .sections()
+        .filter(|s| s.kind() == object::SectionKind::Text)
+        .map(|s| s.size())
+        .sum();
+    let hash = sha256(data);
+    let id = sha256(format!("{path}\0{offset}\0{hash}").as_bytes());
+    Ok(Artifact {
+        id,
+        path: path.into(),
+        sha256: hash,
+        architecture,
+        slice_offset: offset,
+        text_bytes,
+    })
+}
+
+#[cfg(feature = "std")]
+pub fn split_slices(data: &[u8]) -> Result<Vec<(u64, &[u8])>> {
+    let magic = data
+        .get(..4)
+        .ok_or(refuse!("file is shorter than a Mach-O magic"))?;
+    let fat = match magic {
+        [0xca, 0xfe, 0xba, 0xbe] => Some((false, false)),
+        [0xbe, 0xba, 0xfe, 0xca] => Some((true, false)),
+        [0xca, 0xfe, 0xba, 0xbf] => Some((false, true)),
+        [0xbf, 0xba, 0xfe, 0xca] => Some((true, true)),
+        _ => None,
+    };
+    let Some((little, wide)) = fat else {
+        return Ok(vec![(0, data)]);
+    };
+    let count = integer(data, 4, 4, little)? as usize;
+    let stride = if wide { 32 } else { 20 };
+    require!(count > 0 && count <= 128, "invalid fat slice count");
+    require!(8 + count * stride <= data.len(), "truncated fat table");
+    let mut ranges = vec![];
+    let mut slices = vec![];
+    for i in 0..count {
+        let start = 8 + i * stride;
+        let offset = integer(data, start + 8, if wide { 8 } else { 4 }, little)?;
+        let size = integer(
+            data,
+            start + if wide { 16 } else { 12 },
+            if wide { 8 } else { 4 },
+            little,
+        )?;
+        let end = offset
+            .checked_add(size)
+            .ok_or(refuse!("fat range overflow"))?;
+        require!(
+            offset >= (8 + count * stride) as u64 && size > 0,
+            "fat slice overlaps header or is empty"
+        );
+        require!(
+            ranges.iter().all(|&(a, b)| end <= a || offset >= b),
+            "fat slices overlap"
+        );
+        ranges.push((offset, end));
+        slices.push((offset, slice(data, offset, size)?));
+    }
+    Ok(slices)
+}
+
+#[cfg(feature = "std")]
+pub fn inspect(data: &[u8], path: &str) -> Result<Vec<Artifact>> {
+    split_slices(data)?
+        .into_iter()
+        .map(|(offset, bytes)| artifact(bytes, path, offset))
+        .collect()
+}
+
+#[cfg(feature = "std")]
+/// The single arm64/arm64e slice of `data`, optionally narrowed by architecture.
+pub fn select_slice<'a>(
+    data: &'a [u8],
+    _path: &std::path::Path,
+    requested_architecture: Option<&str>,
+) -> Result<(u64, &'a [u8])> {
+    let mut selected = None;
+    let mut selected_len = 0;
+    // Validate every slice, including architectures that cannot be selected.
+    for (offset, bytes) in split_slices(data)? {
+        let file = parsed_macho(bytes)?;
+        let label = architecture(&file, bytes)?;
+        if matches!(label.as_ref(), "arm64" | "arm64e")
+            && requested_architecture.is_none_or(|wanted| wanted == label.as_ref())
+        {
+            selected = Some((offset, bytes));
+            selected_len += 1;
+        }
+    }
+    selected.filter(|_| selected_len == 1).ok_or_else(|| {
+        refuse!(
+            "expected exactly one matching Apple executable slice, found {selected_len}; select --architecture arm64 or arm64e",
+            selected_len
+        )
+        .into()
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anyhow::Result;
+    fn thin(cpu: u32, subtype: u32) -> Vec<u8> {
+        let mut data = vec![];
+        for value in [0xfeedfacf, cpu, subtype, 2, 0, 0, 0, 0] {
+            data.extend(value.to_le_bytes());
+        }
+        data
+    }
+    #[test]
+    fn reads_slices_and_rejects_bad_ranges() -> Result<()> {
+        let arm = thin(0x0100000c, 0x80000002);
+        assert_eq!(inspect(&arm, "arm")?[0].architecture, "arm64e");
+        let intel = thin(0x01000007, 3);
+        let mut fat = vec![];
+        for value in [
+            0xcafebabeu32,
+            2,
+            0x0100000c,
+            2,
+            48,
+            32,
+            0,
+            0x01000007,
+            3,
+            80,
+            32,
+            0,
+        ] {
+            fat.extend(value.to_be_bytes());
+        }
+        fat.extend(arm);
+        fat.extend(intel);
+        let slices = inspect(&fat, "universal")?;
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slices[1].architecture, "x86_64");
+        let path = std::path::Path::new("universal");
+        assert_eq!(select_slice(&fat, path, None)?, (48, &fat[48..80]));
+        assert_eq!(
+            select_slice(&fat, path, Some("arm64e"))?,
+            (48, &fat[48..80])
+        );
+        let mut ambiguous = fat.clone();
+        ambiguous[80..].copy_from_slice(&thin(0x0100000c, 0));
+        assert!(
+            select_slice(&ambiguous, path, None)
+                .unwrap_err()
+                .to_string()
+                .contains("found 2")
+        );
+        assert_eq!(
+            select_slice(&ambiguous, path, Some("arm64"))?,
+            (80, &ambiguous[80..])
+        );
+        let mut bad_sibling = fat.clone();
+        bad_sibling[80..84].fill(0);
+        assert!(select_slice(&bad_sibling, path, Some("arm64e")).is_err());
+        fat[36..40].copy_from_slice(&4096u32.to_be_bytes());
+        assert!(inspect(&fat, "broken").is_err());
+        Ok(())
+    }
+    #[test]
+    fn new_apple_subtypes_are_named_without_becoming_baseline_execution() -> Result<()> {
+        for (subtype, label) in [(0x8000000c, "arm64e.x1"), (0x8000007f, "arm64-subtype-127")] {
+            let bytes = thin(0x0100000c, subtype);
+            assert_eq!(inspect(&bytes, "own-subtype")?[0].architecture, label);
+            assert!(select_slice(&bytes, std::path::Path::new("own-subtype"), None).is_err());
+            assert!(
+                matches!(load_plan::plan(&bytes), Err(load_plan::PlanError::UnsupportedCpu { cpu_subtype, .. }) if cpu_subtype == subtype)
+            );
+        }
+        Ok(())
+    }
+}

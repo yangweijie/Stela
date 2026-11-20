@@ -1,0 +1,1329 @@
+//! The rules the native MMIO aperture's owned mappings rely on: the processor
+//! controls that make its uncached leaves uncached on Intel and AMD alike,
+//! which host processors and roots may use it, how a retired translation
+//! leaves every processor's TLB, and where a PCI BAR sits in the CPU's
+//! physical space. Pure functions over observed register values and firmware
+//! descriptions, and the shootdown's generation bookkeeping.
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering, fence};
+
+use stela_contracts::bytes::HOST_PAGE_BYTES as PAGE;
+
+const CR0_WRITE_PROTECT: u64 = 1 << 16;
+const CR4_LA57: u64 = 1 << 12;
+const CR4_PCIDE: u64 = 1 << 17;
+const EFER_NXE: u64 = 1 << 11;
+/// The IA32_PAT memory type encodings (Intel SDM Vol. 3A 12.12.2, AMD APM
+/// Vol. 2 7.8.1 give the same table).
+const WRITE_BACK: u8 = 6;
+const UNCACHED: u8 = 0;
+/// The PAT entry a PTE with PWT and PCD set and PAT clear selects: the
+/// aperture's leaves.
+pub const LEAF_PAT_INDEX: u32 = 3;
+
+/// One host processor's controls, read in the host's root.
+#[derive(Clone, Copy, Debug)]
+pub struct Controls {
+    pub cr0: u64,
+    pub cr3: u64,
+    pub cr4: u64,
+    pub efer: u64,
+    pub pat: u64,
+    /// The paging levels the loader built the window for, 4 or 5.
+    pub levels: u32,
+}
+
+/// Why the controls cannot carry the aperture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// PAT entry 0 is not write-back, so the page tables' own
+    /// write-back aliases are not.
+    TablesNotWriteBack,
+    /// The leaves' PAT entry is not uncached.
+    LeavesNotUncached,
+    /// Supervisor writes ignore read-only leaves without CR0.WP.
+    WriteProtectOff,
+    /// CR3 carries cache controls for the root without PCIDs.
+    RootCacheControls,
+    /// CR4.LA57 does not match the window's paging levels.
+    PagingLevels,
+    /// The leaves set NX, reserved without EFER.NXE.
+    NoExecuteOff,
+}
+
+/// How a retired aperture translation leaves this processor's TLB.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Flush {
+    /// INVLPG each page: without PCIDs it covers every root.
+    Pages,
+    /// Toggle CR4.PGE, which drops every PCID's entries (Intel SDM Vol. 3A
+    /// 4.10.4.1, AMD APM Vol. 2 5.5.3): the loader root has a PCID of its own
+    /// while the engine runs.
+    AllContexts,
+}
+
+/// Check the controls the aperture needs and choose its TLB flush.
+pub fn qualify(controls: &Controls) -> Result<Flush, Refusal> {
+    let pat = |index: u32| (controls.pat >> (8 * index)) as u8;
+    if pat(0) != WRITE_BACK {
+        return Err(Refusal::TablesNotWriteBack);
+    }
+    if pat(LEAF_PAT_INDEX) != UNCACHED {
+        return Err(Refusal::LeavesNotUncached);
+    }
+    if controls.cr0 & CR0_WRITE_PROTECT == 0 {
+        return Err(Refusal::WriteProtectOff);
+    }
+    let tagged = controls.cr4 & CR4_PCIDE != 0;
+    if !tagged && controls.cr3 & 0xfff != 0 {
+        return Err(Refusal::RootCacheControls);
+    }
+    if (controls.cr4 & CR4_LA57 != 0) != (controls.levels == 5) {
+        return Err(Refusal::PagingLevels);
+    }
+    if controls.efer & EFER_NXE == 0 {
+        return Err(Refusal::NoExecuteOff);
+    }
+    Ok(if tagged {
+        Flush::AllContexts
+    } else {
+        Flush::Pages
+    })
+}
+
+/// Whether a root whose top-level entry for the aperture is `current`
+/// reaches the aperture's leaves, given the loader root's `loader` entry:
+/// every root copies the loader's window entries, so equal present entries
+/// lead to the same tables.
+pub fn shares_aperture(current: u64, loader: u64) -> bool {
+    current & 1 != 0 && current == loader
+}
+
+/// The most processors that may share the aperture, MADT's 8-bit APIC IDs
+/// and x2APIC's beyond them alike: the boot's processor cap.
+pub const MAX_PROCESSORS: usize = 256;
+
+/// How many recent requests keep the range they retired ([`Processors::plan`]).
+pub const RECORDED: usize = 16;
+/// The most pages a processor flushes one by one when it acknowledges; more
+/// flush every translation.
+pub const RANGE_PAGES: u64 = 16;
+/// A recorded slot's generation while a request writes it.
+const WRITING: u64 = u64::MAX;
+
+/// What a processor does, for the report of a shootdown it holds up.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Doing {
+    /// Engine, guest or host work with interrupts off: it acknowledges at its
+    /// next safe point.
+    Masked = 0,
+    /// A compile job with the shootdown vector open: it acknowledges in the
+    /// vector's handler.
+    Job = 1,
+    /// A compile job with interrupts off.
+    MaskedJob = 2,
+    /// Waiting for its own shootdown, acknowledging others' as it waits.
+    Retiring = 3,
+}
+
+impl Doing {
+    fn of(bits: u64) -> Self {
+        match bits & 3 {
+            1 => Self::Job,
+            2 => Self::MaskedJob,
+            3 => Self::Retiring,
+            _ => Self::Masked,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Masked => "masked",
+            Self::Job => "job",
+            Self::MaskedJob => "masked job",
+            Self::Retiring => "retiring",
+        }
+    }
+}
+
+/// One joined processor, on a cache line of its own: retirements read every
+/// one and each processor writes only its own.
+#[derive(Debug)]
+#[repr(align(64))]
+struct Sharer {
+    apic: AtomicU32,
+    acknowledged: AtomicU64,
+    /// [`Doing`] in the low two bits, the TSC it began at above them.
+    doing: AtomicU64,
+    /// Halted with no translation it uses before it flushes again
+    /// ([`Processors::enter_idle`]).
+    idle: AtomicBool,
+    /// In a terminal handler, flushed, for good ([`Processors::enter_terminal`]).
+    terminal: AtomicBool,
+    /// Its NMI gate answers a retirement's NMI ([`Processors::set_reachable`]).
+    reachable: AtomicBool,
+    /// A retirement sent it an NMI its gate has not taken yet.
+    poked: AtomicBool,
+    /// NMIs its gate may take with nothing left to claim, and the TSC of
+    /// the latest gate that left one ([`Processors::nmi_gate`]). Only the
+    /// processor's own gate, which no NMI interrupts, uses them.
+    spare: AtomicU64,
+    spare_at: AtomicU64,
+    /// The latest generation its NMI gate flushed through, and the
+    /// instruction the NMI found it at.
+    answered: AtomicU64,
+    rip: AtomicU64,
+}
+
+/// What a processor's NMI gate does with one NMI ([`Processors::nmi_gate`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NmiGate {
+    /// A counter sample, already taken: return.
+    Sample,
+    /// A retirement's: answer it (flush and acknowledge), then return.
+    Poke,
+    /// The second NMI of two sources a gate claimed together: return.
+    Spare,
+    /// Nothing claims it, or the step watchdog's: stop.
+    Stop,
+}
+
+/// The range one request retired, by generation; read like a sequence
+/// lock: valid only when its generation reads the same before and after.
+#[derive(Debug)]
+struct Recorded {
+    generation: AtomicU64,
+    start: AtomicU64,
+    end: AtomicU64,
+}
+
+/// Up to [`RECORDED`] retired address ranges: what a processor flushes to
+/// acknowledge a request ([`Processors::plan`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ranges {
+    ranges: [(u64, u64); RECORDED],
+    count: usize,
+}
+
+impl Ranges {
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = core::ops::Range<u64>> + '_ {
+        self.ranges[..self.count]
+            .iter()
+            .map(|&(start, end)| start..end)
+    }
+}
+
+/// Which host processors may hold aperture translations, and how far each
+/// has flushed. Until an AP joins, only the boot processor runs and a
+/// retirement's local flush is complete. After that a retirement
+/// [`request`]s a generation, interrupts every [`sharer`], and waits until
+/// each has [`acknowledge`]d it: a processor acknowledges a generation once
+/// it has flushed every aperture translation the requests up to it retired
+/// ([`plan`]). Installation needs no remote flush, since processors do not
+/// cache not-present entries, and the permission's lock orders installations
+/// and retirements.
+///
+/// [`request`]: Self::request
+/// [`sharer`]: Self::sharers
+/// [`acknowledge`]: Self::acknowledge
+/// [`plan`]: Self::plan
+#[derive(Debug)]
+pub struct Processors {
+    joined: AtomicUsize,
+    requested: AtomicU64,
+    sharers: [Sharer; MAX_PROCESSORS],
+    recorded: [Recorded; RECORDED],
+}
+
+impl Default for Processors {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Processors {
+    pub const fn new() -> Self {
+        Self {
+            joined: AtomicUsize::new(0),
+            requested: AtomicU64::new(0),
+            sharers: [const {
+                Sharer {
+                    apic: AtomicU32::new(0),
+                    acknowledged: AtomicU64::new(0),
+                    doing: AtomicU64::new(0),
+                    idle: AtomicBool::new(false),
+                    terminal: AtomicBool::new(false),
+                    reachable: AtomicBool::new(false),
+                    poked: AtomicBool::new(false),
+                    spare: AtomicU64::new(0),
+                    spare_at: AtomicU64::new(0),
+                    answered: AtomicU64::new(0),
+                    rip: AtomicU64::new(0),
+                }
+            }; MAX_PROCESSORS],
+            recorded: [const {
+                Recorded {
+                    generation: AtomicU64::new(0),
+                    start: AtomicU64::new(0),
+                    end: AtomicU64::new(0),
+                }
+            }; RECORDED],
+        }
+    }
+
+    /// Register the installed BSP before admitting any AP.
+    pub fn join_bsp(&self, apic: u32) -> Option<usize> {
+        if self.joined.load(Ordering::Relaxed) != 0 {
+            return None;
+        }
+        self.join(apic)
+    }
+
+    /// The BSP registers each AP before it can translate through the aperture.
+    pub fn join_ap(&self, apic: u32) -> Option<usize> {
+        if self.joined.load(Ordering::Relaxed) == 0 || self.slot(apic).is_some() {
+            return None;
+        }
+        self.join(apic)
+    }
+
+    fn join(&self, apic: u32) -> Option<usize> {
+        let slot = self.joined.load(Ordering::Relaxed);
+        if slot == MAX_PROCESSORS {
+            return None;
+        }
+        let sharer = &self.sharers[slot];
+        sharer.apic.store(apic, Ordering::Relaxed);
+        sharer
+            .acknowledged
+            .store(self.requested.load(Ordering::Acquire), Ordering::Relaxed);
+        self.joined.store(slot + 1, Ordering::Release);
+        Some(slot)
+    }
+
+    /// Count the joined processor with `apic` ID, an AP that failed to
+    /// start and halted or never ran, as having acknowledged every flush:
+    /// it takes no further aperture translation, so no retirement waits on
+    /// it. It stays a sharer; an interrupt to it is harmless.
+    pub fn exclude(&self, apic: u32) {
+        if let Some(slot) = self.slot(apic) {
+            self.sharers[slot]
+                .acknowledged
+                .store(u64::MAX, Ordering::Release);
+        }
+    }
+
+    /// Whether only the boot processor may hold aperture translations.
+    pub fn alone(&self) -> bool {
+        self.joined.load(Ordering::Acquire) <= 1
+    }
+
+    /// The slot of the processor with `apic` ID.
+    pub fn slot(&self, apic: u32) -> Option<usize> {
+        (0..self.joined.load(Ordering::Acquire))
+            .find(|&slot| self.sharers[slot].apic.load(Ordering::Relaxed) == apic)
+    }
+
+    /// Each joined processor's slot and APIC ID.
+    pub fn sharers(&self) -> impl Iterator<Item = (usize, u32)> + '_ {
+        (0..self.joined.load(Ordering::Acquire))
+            .map(|slot| (slot, self.sharers[slot].apic.load(Ordering::Relaxed)))
+    }
+
+    /// Publish a flush request after the retired entries are cleared; the
+    /// generation each sharer must acknowledge. `retired` is the address
+    /// range whose entries were cleared, or `None` when they are not one
+    /// range. Interrupts are sent after this returns, so a processor woken by
+    /// one sees the request and, unless it looked before the range was
+    /// recorded, the range.
+    pub fn request(&self, retired: Option<core::ops::Range<u64>>) -> u64 {
+        let generation = self.requested.fetch_add(1, Ordering::AcqRel) + 1;
+        // Ordered before the reads of every sharer's idle state, as
+        // [`Self::leave_idle`] orders its store before its next read of the
+        // request: either this sees it awake, or it sees this request.
+        fence(Ordering::SeqCst);
+        if let Some(range) = retired {
+            self.record(generation, range);
+        }
+        generation
+    }
+
+    /// Keep `range` for `generation` in its slot, unless a request for a
+    /// later generation holds or writes the slot: a reader that finds no
+    /// matching generation flushes everything.
+    fn record(&self, generation: u64, range: core::ops::Range<u64>) {
+        let recorded = &self.recorded[generation as usize % RECORDED];
+        let current = recorded.generation.load(Ordering::Relaxed);
+        if current == WRITING
+            || current > generation
+            || recorded
+                .generation
+                .compare_exchange(current, WRITING, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        // A reader that sees either value below sees WRITING or a later
+        // generation on its second look.
+        core::sync::atomic::fence(Ordering::Release);
+        recorded.start.store(range.start, Ordering::Relaxed);
+        recorded.end.store(range.end, Ordering::Relaxed);
+        recorded.generation.store(generation, Ordering::Release);
+    }
+
+    /// The range `generation` retired, when it is still recorded.
+    fn recorded(&self, generation: u64) -> Option<(u64, u64)> {
+        let recorded = &self.recorded[generation as usize % RECORDED];
+        if recorded.generation.load(Ordering::Acquire) != generation {
+            return None;
+        }
+        let start = recorded.start.load(Ordering::Relaxed);
+        let end = recorded.end.load(Ordering::Relaxed);
+        core::sync::atomic::fence(Ordering::Acquire);
+        (recorded.generation.load(Ordering::Relaxed) == generation).then_some((start, end))
+    }
+
+    /// What a processor that flushed through `flushed` flushes to
+    /// acknowledge `requested`: the ranges of every request after `flushed`
+    /// (none once it is there) when each is recorded and they hold
+    /// [`RANGE_PAGES`] pages or fewer; `None`, everything, when it is too
+    /// far behind, a request has no range or they hold more. Generations
+    /// count up from 1 and never wrap: a 64-bit count of requests would take
+    /// centuries to.
+    pub fn plan(&self, flushed: u64, requested: u64) -> Option<Ranges> {
+        let mut ranges = Ranges {
+            ranges: [(0, 0); RECORDED],
+            count: 0,
+        };
+        if requested <= flushed {
+            return Some(ranges);
+        }
+        if requested - flushed > RECORDED as u64 {
+            return None;
+        }
+        let mut pages = 0u64;
+        for generation in flushed + 1..=requested {
+            let (start, end) = self.recorded(generation)?;
+            pages = pages.saturating_add(end.saturating_sub(start).div_ceil(PAGE));
+            if pages > RANGE_PAGES {
+                return None;
+            }
+            ranges.ranges[ranges.count] = (start, end);
+            ranges.count += 1;
+        }
+        Some(ranges)
+    }
+
+    /// Note what slot `slot`'s processor does from TSC `now` on; what it did.
+    pub fn set_doing(&self, slot: usize, doing: Doing, now: u64) -> Doing {
+        self.sharers.get(slot).map_or(Doing::Masked, |sharer| {
+            Doing::of(
+                sharer
+                    .doing
+                    .swap(now << 2 | doing as u64, Ordering::Relaxed),
+            )
+        })
+    }
+
+    /// Slot `slot`'s processor, which flushed through its last request,
+    /// halts: until [`Self::leave_idle`] it makes no access through a
+    /// window translation, so a retirement need not wait for it and counts
+    /// it as acknowledged, as Linux skips a CPU in lazy TLB mode.
+    pub fn enter_idle(&self, slot: usize) {
+        if let Some(sharer) = self.sharers.get(slot) {
+            sharer.idle.store(true, Ordering::Release);
+        }
+    }
+
+    /// Slot `slot`'s processor wakes: whether it was idle. When it was, it
+    /// flushes through [`Self::requested`] before any access through a
+    /// window translation; a request it does not see then waits for it.
+    pub fn leave_idle(&self, slot: usize) -> bool {
+        let Some(sharer) = self.sharers.get(slot) else {
+            return false;
+        };
+        // Only the processor itself writes its state.
+        if !sharer.idle.load(Ordering::Relaxed) {
+            return false;
+        }
+        sharer.idle.store(false, Ordering::Relaxed);
+        // Pairs with the fence in [`Self::request`].
+        fence(Ordering::SeqCst);
+        true
+    }
+
+    /// Whether slot `slot`'s processor is idle ([`Self::enter_idle`]).
+    pub fn idle(&self, slot: usize) -> bool {
+        self.sharers
+            .get(slot)
+            .is_some_and(|sharer| sharer.idle.load(Ordering::Relaxed))
+    }
+
+    /// Slot `slot`'s processor, which flushed through its last request,
+    /// runs a terminal handler (#MC, #DF, a stop's NMI) and never returns to
+    /// the work it interrupted: from now on no retirement waits for it or
+    /// sends it an NMI ([`Self::poke`]), which would land on the stack of a
+    /// handler that cannot take one. It flushes itself again before it draws
+    /// the stop's screen. Pairs, as [`Self::leave_idle`] does, with the
+    /// fence in [`Self::request`]: either a retirement sees the processor
+    /// terminal, or the caller, flushing after this, sees its request.
+    pub fn enter_terminal(&self, slot: usize) {
+        if let Some(sharer) = self.sharers.get(slot) {
+            sharer.terminal.store(true, Ordering::Release);
+        }
+        fence(Ordering::SeqCst);
+    }
+
+    /// Whether slot `slot`'s processor runs a terminal handler
+    /// ([`Self::enter_terminal`]).
+    pub fn terminal(&self, slot: usize) -> bool {
+        self.sharers
+            .get(slot)
+            .is_some_and(|sharer| sharer.terminal.load(Ordering::Acquire))
+    }
+
+    /// Whether a retirement of `generation` waits for slot `slot`'s
+    /// processor: it neither acknowledged it nor is idle or terminal.
+    pub fn pending(&self, slot: usize, generation: u64) -> bool {
+        self.acknowledged(slot) < generation && !self.idle(slot) && !self.terminal(slot)
+    }
+
+    /// Slot `slot`'s processor runs with its own interrupt tables, whose
+    /// NMI gate answers a retirement's NMI ([`Self::poke`]): only from then
+    /// on may one be sent to it.
+    pub fn set_reachable(&self, slot: usize) {
+        if let Some(sharer) = self.sharers.get(slot) {
+            sharer.reachable.store(true, Ordering::Release);
+        }
+    }
+
+    /// Whether slot `slot`'s processor may be sent an NMI
+    /// ([`Self::set_reachable`]).
+    pub fn reachable(&self, slot: usize) -> bool {
+        self.sharers
+            .get(slot)
+            .is_some_and(|sharer| sharer.reachable.load(Ordering::Acquire))
+    }
+
+    /// Ask slot `slot`'s processor, which has not acknowledged `generation`
+    /// in time, to answer by NMI: whether the caller sends it one. One that
+    /// cannot take it (not reachable), needs none (idle or acknowledged) or
+    /// has one outstanding gets none. The mark is set before the NMI is
+    /// sent, so the gate of an NMI that comes first (a counter sample's) may
+    /// take it, and the retirement's NMI then finds nothing to claim
+    /// ([`Self::nmi_gate`]).
+    pub fn poke(&self, slot: usize, generation: u64) -> bool {
+        let Some(sharer) = self.sharers.get(slot) else {
+            return false;
+        };
+        sharer.reachable.load(Ordering::Acquire)
+            && self.pending(slot, generation)
+            && sharer
+                .poked
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+    }
+
+    /// The NMI [`Self::poke`] asked for could not be sent: a later
+    /// escalation may send one.
+    pub fn unpoke(&self, slot: usize) {
+        if let Some(sharer) = self.sharers.get(slot) {
+            sharer.poked.store(false, Ordering::Release);
+        }
+    }
+
+    /// Slot `slot`'s NMI gate decides what one NMI was: a counter sample
+    /// its own handler took (`sampled`), a retirement's ([`Self::poke`]),
+    /// the step watchdog's (`watchdog`, asked only when needed), or the
+    /// second NMI of two sources one gate already claimed together.
+    ///
+    /// Two NMI sources do not always arrive as one NMI: a processor holds
+    /// one NMI back while its gate runs and takes it after, and a
+    /// hypervisor queues two. The retirement marks its NMI before it sends
+    /// it, so a gate that took a sample may find that mark while the
+    /// retirement's NMI is still on its way, or a retirement's gate may
+    /// reload a counter whose own NMI is held back. Either way the other
+    /// NMI then comes with nothing to claim, as Linux's `swallow_nmi` knows
+    /// (`arch/x86/kernel/nmi.c`): a gate that claimed both leaves one
+    /// spare, and an NMI with nothing to claim within `within` TSC ticks
+    /// of it takes that spare and returns. Any other unclaimed NMI stops.
+    pub fn nmi_gate(
+        &self,
+        slot: usize,
+        sampled: bool,
+        watchdog: impl FnOnce() -> bool,
+        now: u64,
+        within: u64,
+    ) -> NmiGate {
+        let Some(sharer) = self.sharers.get(slot) else {
+            return if sampled && !watchdog() {
+                NmiGate::Sample
+            } else {
+                NmiGate::Stop
+            };
+        };
+        if !self.take_poke(slot) {
+            if watchdog() {
+                return NmiGate::Stop;
+            }
+            if sampled {
+                return NmiGate::Sample;
+            }
+            let spare = sharer.spare.load(Ordering::Relaxed);
+            let fresh = now.wrapping_sub(sharer.spare_at.load(Ordering::Relaxed)) <= within;
+            if spare == 0 || !fresh {
+                sharer.spare.store(0, Ordering::Relaxed);
+                return NmiGate::Stop;
+            }
+            sharer.spare.store(spare - 1, Ordering::Relaxed);
+            return NmiGate::Spare;
+        }
+        if watchdog() {
+            return NmiGate::Stop;
+        }
+        if sampled {
+            sharer.spare.fetch_add(1, Ordering::Relaxed);
+            sharer.spare_at.store(now, Ordering::Relaxed);
+        }
+        NmiGate::Poke
+    }
+
+    /// In slot `slot`'s NMI gate: whether a retirement sent the NMI it
+    /// takes, which it then answers. Cleared first, so a retirement may
+    /// send the next one at once; the processor holds NMIs until its gate
+    /// returns, so that one arrives after.
+    pub fn take_poke(&self, slot: usize) -> bool {
+        self.sharers
+            .get(slot)
+            .is_some_and(|sharer| sharer.poked.swap(false, Ordering::AcqRel))
+    }
+
+    /// Slot `slot`'s NMI gate flushed through `generation`, having found the
+    /// processor at instruction `rip`.
+    pub fn answered_by_nmi(&self, slot: usize, generation: u64, rip: u64) {
+        if let Some(sharer) = self.sharers.get(slot) {
+            sharer.rip.store(rip, Ordering::Relaxed);
+            sharer.answered.fetch_max(generation, Ordering::Release);
+        }
+    }
+
+    /// The instruction slot `slot`'s processor was at when its NMI gate
+    /// answered `generation` or a later request; `None` when it answered
+    /// otherwise.
+    pub fn nmi_answer(&self, slot: usize, generation: u64) -> Option<u64> {
+        let sharer = self.sharers.get(slot)?;
+        (sharer.answered.load(Ordering::Acquire) >= generation)
+            .then(|| sharer.rip.load(Ordering::Relaxed))
+    }
+
+    /// What slot `slot`'s processor does, and the TSC it began at.
+    pub fn doing(&self, slot: usize) -> (Doing, u64) {
+        self.sharers.get(slot).map_or((Doing::Masked, 0), |sharer| {
+            let bits = sharer.doing.load(Ordering::Relaxed);
+            (Doing::of(bits), bits >> 2)
+        })
+    }
+
+    /// The latest requested generation.
+    pub fn requested(&self) -> u64 {
+        self.requested.load(Ordering::Acquire)
+    }
+
+    /// Slot `slot`'s processor flushed every translation older than
+    /// `generation`'s request.
+    pub fn acknowledge(&self, slot: usize, generation: u64) {
+        if let Some(sharer) = self.sharers.get(slot) {
+            sharer.acknowledged.fetch_max(generation, Ordering::Release);
+        }
+    }
+
+    /// The generation slot `slot`'s processor last acknowledged.
+    pub fn acknowledged(&self, slot: usize) -> u64 {
+        self.sharers
+            .get(slot)
+            .map_or(0, |sharer| sharer.acknowledged.load(Ordering::Acquire))
+    }
+
+    /// Whether every sharer but `except` (the retiring processor's slot)
+    /// acknowledged `generation` or is idle.
+    pub fn flushed(&self, generation: u64, except: Option<usize>) -> bool {
+        self.sharers()
+            .all(|(slot, _)| Some(slot) == except || !self.pending(slot, generation))
+    }
+}
+
+/// The slowest of the late acknowledgements since the last report: how many
+/// came late, the longest wait, and the processor behind it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Late {
+    pub count: u64,
+    pub ticks: u64,
+    pub apic: u32,
+    pub doing: Doing,
+    /// Where its NMI gate found it, when an NMI answered.
+    pub rip: Option<u64>,
+}
+
+/// Late acknowledgements, kept for one report a period at most
+/// ([`Lates::take`]). Retirements note them at once; the details of the
+/// longest may mix two that end together, which only a report reads.
+#[derive(Debug)]
+pub struct Lates {
+    count: AtomicU64,
+    ticks: AtomicU64,
+    apic: AtomicU32,
+    doing: AtomicU64,
+    /// One past the NMI's instruction, 0 when no NMI answered.
+    rip: AtomicU64,
+    /// The TSC of the last report.
+    reported: AtomicU64,
+}
+
+impl Default for Lates {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Lates {
+    pub const fn new() -> Self {
+        Self {
+            count: AtomicU64::new(0),
+            ticks: AtomicU64::new(0),
+            apic: AtomicU32::new(0),
+            doing: AtomicU64::new(0),
+            rip: AtomicU64::new(0),
+            reported: AtomicU64::new(0),
+        }
+    }
+
+    /// A retirement waited `ticks` for the processor with `apic` ID, doing
+    /// `doing`, which its NMI gate answered at `rip` when one did.
+    pub fn note(&self, ticks: u64, apic: u32, doing: Doing, rip: Option<u64>) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+        if self.ticks.fetch_max(ticks, Ordering::Relaxed) < ticks {
+            self.apic.store(apic, Ordering::Relaxed);
+            self.doing.store(doing as u64, Ordering::Relaxed);
+            self.rip
+                .store(rip.map_or(0, |rip| rip.wrapping_add(1)), Ordering::Relaxed);
+        }
+    }
+
+    /// What came late since the last report, when there is any and the
+    /// last report is at least `period` ticks before `now`: one caller gets
+    /// it and the record starts again.
+    pub fn take(&self, now: u64, period: u64) -> Option<Late> {
+        let reported = self.reported.load(Ordering::Relaxed);
+        if self.count.load(Ordering::Relaxed) == 0
+            || (reported != 0 && now.wrapping_sub(reported) < period)
+            || self
+                .reported
+                .compare_exchange(reported, now.max(1), Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return None;
+        }
+        let rip = self.rip.swap(0, Ordering::Relaxed);
+        Some(Late {
+            count: self.count.swap(0, Ordering::Relaxed),
+            ticks: self.ticks.swap(0, Ordering::Relaxed),
+            apic: self.apic.load(Ordering::Relaxed),
+            doing: Doing::of(self.doing.load(Ordering::Relaxed)),
+            rip: rip.checked_sub(1),
+        })
+    }
+}
+
+/// A root bridge's memory window as firmware describes it: bus addresses
+/// `minimum..=maximum`, which the CPU reaches at `translation` above them.
+#[derive(Clone, Copy, Debug)]
+pub struct BusWindow {
+    pub segment: u32,
+    pub minimum: u64,
+    pub maximum: u64,
+    pub translation: u64,
+}
+
+/// The CPU physical address of a memory BAR at bus address `address` for
+/// `bytes` on `segment`, when one root bridge window holds all of it.
+pub fn bar_physical(
+    windows: impl IntoIterator<Item = BusWindow>,
+    segment: u32,
+    address: u64,
+    bytes: u64,
+) -> Option<u64> {
+    let last = address.checked_add(bytes.checked_sub(1)?)?;
+    windows
+        .into_iter()
+        .find(|window| {
+            window.segment == segment && window.minimum <= address && last <= window.maximum
+        })
+        .and_then(|window| address.checked_add(window.translation))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PAT_DEFAULT: u64 = 0x0007_0406_0007_0406;
+
+    fn controls() -> Controls {
+        Controls {
+            cr0: 0x8001_0033,
+            cr3: 0x1000,
+            cr4: 0x20,
+            efer: 0xd01,
+            pat: PAT_DEFAULT,
+            levels: 4,
+        }
+    }
+
+    #[test]
+    fn the_power_on_pat_carries_the_aperture_on_either_vendor() {
+        assert_eq!(qualify(&controls()), Ok(Flush::Pages));
+        let five = Controls {
+            cr4: 0x20 | CR4_LA57,
+            levels: 5,
+            ..controls()
+        };
+        assert_eq!(qualify(&five), Ok(Flush::Pages));
+    }
+
+    #[test]
+    fn pcids_flush_every_context_and_allow_tagged_roots() {
+        let tagged = Controls {
+            cr3: 0x1001,
+            cr4: 0x20 | CR4_PCIDE,
+            ..controls()
+        };
+        assert_eq!(qualify(&tagged), Ok(Flush::AllContexts));
+        let untagged = Controls {
+            cr3: 0x1018,
+            ..controls()
+        };
+        assert_eq!(qualify(&untagged), Err(Refusal::RootCacheControls));
+    }
+
+    #[test]
+    fn controls_the_leaves_depend_on_refuse() {
+        for (changed, refusal) in [
+            (
+                Controls {
+                    pat: PAT_DEFAULT & !0xff | 1,
+                    ..controls()
+                },
+                Refusal::TablesNotWriteBack,
+            ),
+            (
+                Controls {
+                    pat: PAT_DEFAULT | 7 << 24,
+                    ..controls()
+                },
+                Refusal::LeavesNotUncached,
+            ),
+            (
+                Controls {
+                    cr0: 0x8000_0033,
+                    ..controls()
+                },
+                Refusal::WriteProtectOff,
+            ),
+            (
+                Controls {
+                    levels: 5,
+                    ..controls()
+                },
+                Refusal::PagingLevels,
+            ),
+            (
+                Controls {
+                    efer: 0x501,
+                    ..controls()
+                },
+                Refusal::NoExecuteOff,
+            ),
+        ] {
+            assert_eq!(qualify(&changed), Err(refusal));
+        }
+    }
+
+    #[test]
+    fn only_the_loader_roots_present_entry_reaches_the_aperture() {
+        assert!(shares_aperture(0x5003, 0x5003));
+        assert!(!shares_aperture(0x5003, 0x6003));
+        assert!(!shares_aperture(0, 0));
+    }
+
+    #[test]
+    fn a_retirement_waits_for_every_sharer_but_the_retiring_one() {
+        let processors = Processors::new();
+        assert!(processors.alone());
+        assert!(processors.flushed(processors.request(None), None));
+        let a = processors.join_bsp(4).unwrap();
+        assert!(processors.alone());
+        let b = processors.join_ap(9).unwrap();
+        assert!(!processors.alone());
+        assert_eq!(processors.slot(9), Some(b));
+        assert_eq!(processors.slot(5), None);
+        // A processor that joins has seen every earlier request.
+        assert!(processors.flushed(processors.requested(), None));
+        let generation = processors.request(None);
+        assert!(!processors.flushed(generation, Some(b)));
+        processors.acknowledge(a, generation);
+        assert!(processors.flushed(generation, Some(b)));
+        assert!(!processors.flushed(generation, None));
+        processors.acknowledge(b, generation);
+        processors.acknowledge(b, generation - 1);
+        assert_eq!(processors.acknowledged(b), generation);
+        assert!(processors.flushed(generation, None));
+        assert_eq!(
+            processors.sharers().collect::<alloc::vec::Vec<_>>(),
+            [(a, 4), (b, 9)]
+        );
+    }
+
+    #[test]
+    fn an_excluded_ap_never_holds_up_a_retirement() {
+        let processors = Processors::new();
+        let bsp = processors.join_bsp(1).unwrap();
+        let ready = processors.join_ap(2).unwrap();
+        processors.join_ap(3).unwrap();
+        processors.exclude(3);
+        // An APIC ID that never joined changes nothing.
+        processors.exclude(9);
+        let generation = processors.request(None);
+        processors.acknowledge(bsp, generation);
+        assert!(!processors.flushed(generation, None));
+        processors.acknowledge(ready, generation);
+        assert!(processors.flushed(generation, None));
+        assert_eq!(processors.sharers().count(), 3);
+    }
+
+    #[test]
+    fn bsp_registration_precedes_aps_and_rejects_duplicate_identities() {
+        let processors = Processors::new();
+        assert_eq!(processors.join_ap(2), None);
+        assert_eq!(processors.join_bsp(0), Some(0));
+        assert!(processors.alone());
+        assert_eq!(processors.join_bsp(1), None);
+        assert_eq!(processors.join_ap(0), None);
+        assert_eq!(processors.join_ap(2), Some(1));
+        assert!(!processors.alone());
+        assert_eq!(processors.join_ap(2), None);
+    }
+
+    #[test]
+    fn bsp_and_ap_retirements_require_the_other_origin_to_acknowledge() {
+        let processors = Processors::new();
+        let bsp = processors.join_bsp(0).unwrap();
+        let ap = processors.join_ap(2).unwrap();
+        let from_bsp = processors.request(None);
+        let from_ap = processors.request(None);
+        assert!(!processors.flushed(from_bsp, Some(bsp)));
+        assert!(!processors.flushed(from_ap, Some(ap)));
+        processors.acknowledge(ap, from_ap);
+        assert!(processors.flushed(from_bsp, Some(bsp)));
+        assert!(!processors.flushed(from_ap, Some(ap)));
+        processors.acknowledge(bsp, from_bsp);
+        assert!(!processors.flushed(from_ap, Some(ap)));
+        processors.acknowledge(bsp, from_ap);
+        assert!(processors.flushed(from_ap, Some(ap)));
+    }
+
+    /// The planned ranges as (start, end) pairs.
+    fn ranges(plan: Option<Ranges>) -> alloc::vec::Vec<(u64, u64)> {
+        plan.expect("a plan of ranges")
+            .iter()
+            .map(|range| (range.start, range.end))
+            .collect()
+    }
+
+    fn nothing(plan: Option<Ranges>) -> bool {
+        plan.is_some_and(|ranges| ranges.is_empty())
+    }
+
+    /// Every joined processor but the retiring one is waited for, whatever
+    /// it does; it acknowledges once it flushed the planned ranges.
+    #[test]
+    fn a_retirement_waits_for_every_other_sharer_whatever_it_does() {
+        let processors = Processors::new();
+        let bsp = processors.join_bsp(0).unwrap();
+        let ap = processors.join_ap(2).unwrap();
+        assert_eq!(processors.set_doing(ap, Doing::Job, 77), Doing::Masked);
+        assert_eq!(processors.doing(ap), (Doing::Job, 77));
+        let generation = processors.request(Some(0x4000..0x6000));
+        // A processor in a job holds translations like any other.
+        assert!(!processors.flushed(generation, Some(bsp)));
+        assert_eq!(
+            ranges(processors.plan(processors.acknowledged(ap), generation)),
+            [(0x4000, 0x6000)]
+        );
+        processors.acknowledge(ap, generation);
+        assert!(processors.flushed(generation, Some(bsp)));
+        assert_eq!(processors.set_doing(ap, Doing::Masked, 90), Doing::Job);
+        assert!(nothing(processors.plan(generation, generation)));
+    }
+
+    /// A processor behind several requests flushes each one's range, and
+    /// everything once they hold more than RANGE_PAGES pages.
+    #[test]
+    fn plans_cover_every_request_since_the_last_flush() {
+        let processors = Processors::new();
+        let first = processors.request(Some(0x1000..0x3000));
+        let second = processors.request(Some(0x9000..0xa000));
+        assert_eq!(
+            ranges(processors.plan(0, second)),
+            [(0x1000, 0x3000), (0x9000, 0xa000)]
+        );
+        assert_eq!(ranges(processors.plan(first, second)), [(0x9000, 0xa000)]);
+        let large = processors.request(Some(0..(RANGE_PAGES + 1) * PAGE));
+        assert_eq!(processors.plan(second, large), None);
+        // Small ones that add up past the bound flush everything too.
+        let start = processors.requested();
+        let mut last = start;
+        for index in 0..RANGE_PAGES {
+            last = processors.request(Some(index * 2 * PAGE..(index * 2 + 1) * PAGE));
+        }
+        assert_eq!(
+            ranges(processors.plan(start, last)).len(),
+            RANGE_PAGES as usize
+        );
+        let more = processors.request(Some(0x100_0000..0x100_1000));
+        assert_eq!(processors.plan(start, more), None);
+        assert_eq!(
+            ranges(processors.plan(last, more)),
+            [(0x100_0000, 0x100_1000)]
+        );
+    }
+
+    /// A request with no range, and one whose slot another request is
+    /// writing, flush everything.
+    #[test]
+    fn unrecorded_requests_flush_everything() {
+        let processors = Processors::new();
+        let ranged = processors.request(Some(0x1000..0x2000));
+        let unranged = processors.request(None);
+        assert_eq!(processors.plan(0, unranged), None);
+        assert_eq!(ranges(processors.plan(0, ranged)), [(0x1000, 0x2000)]);
+        let next = processors.request(Some(0x5000..0x6000));
+        processors.recorded[next as usize % RECORDED]
+            .generation
+            .store(WRITING, Ordering::Relaxed);
+        assert_eq!(processors.plan(unranged, next), None);
+        // A request that finds its slot being written leaves it alone.
+        let later = next + RECORDED as u64;
+        processors.requested.store(later - 1, Ordering::Relaxed);
+        assert_eq!(processors.request(Some(0x7000..0x8000)), later);
+        assert_eq!(processors.plan(later - 1, later), None);
+    }
+
+    /// The record wraps after RECORDED requests: an old generation's slot
+    /// holds a newer one, so a processor that far behind flushes everything,
+    /// and a late writer never overwrites a newer record.
+    #[test]
+    fn recorded_slots_wrap_without_reuse() {
+        let processors = Processors::new();
+        let mut generations = alloc::vec::Vec::new();
+        for index in 0..RECORDED as u64 * 3 {
+            generations.push(processors.request(Some(index * PAGE..(index + 1) * PAGE)));
+        }
+        let last = *generations.last().unwrap();
+        assert_eq!(processors.plan(0, last), None);
+        assert_eq!(processors.plan(last - RECORDED as u64 - 1, last), None);
+        let recent = ranges(processors.plan(last - 4, last));
+        let expected: alloc::vec::Vec<_> = (last - 3..=last)
+            .map(|generation| ((generation - 1) * PAGE, generation * PAGE))
+            .collect();
+        assert_eq!(recent, expected);
+        // A request for an older generation that records late is ignored.
+        processors.record(last - RECORDED as u64, 0xdead_0000..0xdead_1000);
+        assert_eq!(
+            ranges(processors.plan(last - 1, last)),
+            [((last - 1) * PAGE, last * PAGE)]
+        );
+        assert!(nothing(processors.plan(last, last)));
+    }
+
+    /// An idle processor holds up no retirement and is not asked to flush;
+    /// once it wakes it flushes every request since its last flush, and a
+    /// request after that waits for it again.
+    #[test]
+    fn an_idle_processor_counts_as_acknowledged_until_it_wakes() {
+        let processors = Processors::new();
+        let bsp = processors.join_bsp(0).unwrap();
+        let ap = processors.join_ap(2).unwrap();
+        let before = processors.request(Some(0x1000..0x2000));
+        processors.acknowledge(ap, before);
+        processors.enter_idle(ap);
+        assert!(processors.idle(ap));
+        let first = processors.request(Some(0x4000..0x5000));
+        let second = processors.request(Some(0x8000..0x9000));
+        assert!(!processors.pending(ap, second));
+        assert!(processors.flushed(second, Some(bsp)));
+        // Waking, it learns what it has to flush and holds up requests again.
+        assert!(processors.leave_idle(ap));
+        assert!(!processors.leave_idle(ap));
+        assert!(!processors.idle(ap));
+        assert!(processors.pending(ap, second));
+        assert!(!processors.flushed(second, Some(bsp)));
+        assert_eq!(
+            ranges(processors.plan(processors.acknowledged(ap), processors.requested())),
+            [(0x4000, 0x5000), (0x8000, 0x9000)]
+        );
+        processors.acknowledge(ap, second);
+        assert!(processors.flushed(first, Some(bsp)));
+        assert!(processors.flushed(second, Some(bsp)));
+        // The retiring processor's own idle state is never consulted, and a
+        // slot that never joined is never idle.
+        assert!(!processors.leave_idle(MAX_PROCESSORS));
+        processors.enter_idle(MAX_PROCESSORS);
+        assert!(!processors.idle(MAX_PROCESSORS));
+    }
+
+    /// A processor in a terminal handler holds up no retirement and gets no
+    /// NMI, whatever it acknowledged, for the rest of the boot; the others
+    /// still do.
+    #[test]
+    fn a_terminal_processor_is_never_waited_for_or_sent_an_nmi() {
+        let processors = Processors::new();
+        let bsp = processors.join_bsp(0).unwrap();
+        let ap = processors.join_ap(2).unwrap();
+        let other = processors.join_ap(4).unwrap();
+        processors.set_reachable(ap);
+        processors.set_reachable(other);
+        let first = processors.request(None);
+        assert!(processors.pending(ap, first));
+        processors.acknowledge(ap, first);
+        processors.enter_terminal(ap);
+        assert!(processors.terminal(ap) && !processors.terminal(other));
+        let second = processors.request(Some(0x1000..0x2000));
+        assert!(!processors.pending(ap, second));
+        assert!(!processors.poke(ap, second));
+        assert!(!processors.take_poke(ap));
+        // An idle wait that ends does not make it wait-for again.
+        processors.enter_idle(ap);
+        assert!(processors.leave_idle(ap));
+        assert!(!processors.pending(ap, second));
+        // The other processor still holds the retirement up and is poked.
+        assert!(processors.pending(other, second));
+        assert!(!processors.flushed(second, Some(bsp)));
+        assert!(processors.poke(other, second));
+        processors.acknowledge(other, second);
+        assert!(processors.flushed(second, Some(bsp)));
+        // A slot that never joined is never terminal.
+        processors.enter_terminal(MAX_PROCESSORS);
+        assert!(!processors.terminal(MAX_PROCESSORS));
+    }
+
+    /// A retirement may send a late processor one NMI at a time, only
+    /// once its gate answers NMIs, and none to an idle or acknowledged one;
+    /// the gate takes each as a retirement's and records where it was.
+    #[test]
+    fn a_late_processor_gets_one_nmi_at_a_time_from_a_retirement() {
+        let processors = Processors::new();
+        let bsp = processors.join_bsp(0).unwrap();
+        let ap = processors.join_ap(2).unwrap();
+        let generation = processors.request(None);
+        // Its gate is not installed yet: no NMI.
+        assert!(!processors.poke(ap, generation));
+        assert!(!processors.reachable(ap));
+        processors.set_reachable(ap);
+        assert!(processors.reachable(ap));
+        processors.set_reachable(bsp);
+        assert!(processors.poke(ap, generation));
+        // One outstanding at a time, whoever asks.
+        assert!(!processors.poke(ap, generation));
+        // A gate that takes an NMI nobody sent does not answer it.
+        assert!(!processors.take_poke(bsp));
+        assert!(processors.take_poke(ap));
+        assert!(!processors.take_poke(ap));
+        assert_eq!(processors.nmi_answer(ap, generation), None);
+        processors.answered_by_nmi(ap, generation, 0x1234);
+        processors.acknowledge(ap, generation);
+        assert_eq!(processors.nmi_answer(ap, generation), Some(0x1234));
+        // Acknowledged: no NMI; nor once the NMI could not be sent, until
+        // it is asked for again.
+        assert!(!processors.poke(ap, generation));
+        let next = processors.request(None);
+        assert_eq!(processors.nmi_answer(ap, next), None);
+        assert!(processors.poke(ap, next));
+        processors.unpoke(ap);
+        assert!(processors.poke(ap, next));
+        assert!(processors.take_poke(ap));
+        // An idle processor needs none.
+        processors.enter_idle(ap);
+        assert!(!processors.poke(ap, next));
+        assert!(processors.leave_idle(ap));
+        assert!(processors.poke(ap, next));
+        assert!(!processors.poke(MAX_PROCESSORS, next));
+        assert!(!processors.take_poke(MAX_PROCESSORS));
+    }
+
+    /// A counter sample's NMI that comes while a retirement's NMI is on its
+    /// way takes the retirement's mark; the retirement's NMI then comes
+    /// with nothing to claim and returns as the spare, once and only soon
+    /// after. Without a gate that claimed two sources, an unclaimed NMI
+    /// stops, as does the step watchdog's.
+    #[test]
+    fn the_second_nmi_of_two_sources_one_gate_claimed_returns() {
+        let processors = Processors::new();
+        let _bsp = processors.join_bsp(0).unwrap();
+        let ap = processors.join_ap(2).unwrap();
+        processors.set_reachable(ap);
+        let quiet = || false;
+        // Nothing sent and no sample: stop.
+        assert_eq!(
+            processors.nmi_gate(ap, false, quiet, 10, 100),
+            NmiGate::Stop
+        );
+        // A sample alone returns; the watchdog's stops.
+        assert_eq!(
+            processors.nmi_gate(ap, true, quiet, 10, 100),
+            NmiGate::Sample
+        );
+        assert_eq!(
+            processors.nmi_gate(ap, true, || true, 10, 100),
+            NmiGate::Stop
+        );
+        // A retirement marks its NMI; a sample's NMI comes first and
+        // claims both.
+        let generation = processors.request(None);
+        assert!(processors.poke(ap, generation));
+        assert_eq!(
+            processors.nmi_gate(ap, true, quiet, 1000, 100),
+            NmiGate::Poke
+        );
+        // The retirement's own NMI: nothing to claim, the spare returns it.
+        assert_eq!(
+            processors.nmi_gate(ap, false, quiet, 1050, 100),
+            NmiGate::Spare
+        );
+        // Only once.
+        assert_eq!(
+            processors.nmi_gate(ap, false, quiet, 1060, 100),
+            NmiGate::Stop
+        );
+        // A retirement's NMI alone leaves no spare.
+        let next = processors.request(None);
+        assert!(processors.poke(ap, next));
+        assert_eq!(
+            processors.nmi_gate(ap, false, quiet, 2000, 100),
+            NmiGate::Poke
+        );
+        assert_eq!(
+            processors.nmi_gate(ap, false, quiet, 2010, 100),
+            NmiGate::Stop
+        );
+        // A spare left by two sources that came as one NMI does not cover
+        // an unclaimed NMI long after.
+        let late = processors.request(None);
+        assert!(processors.poke(ap, late));
+        assert_eq!(
+            processors.nmi_gate(ap, true, quiet, 3000, 100),
+            NmiGate::Poke
+        );
+        assert_eq!(
+            processors.nmi_gate(ap, false, quiet, 3101, 100),
+            NmiGate::Stop
+        );
+        assert_eq!(
+            processors.nmi_gate(ap, false, quiet, 3102, 100),
+            NmiGate::Stop
+        );
+        // The watchdog's NMI stops even with a mark or a spare.
+        let last = processors.request(None);
+        assert!(processors.poke(ap, last));
+        assert_eq!(
+            processors.nmi_gate(ap, true, quiet, 4000, 100),
+            NmiGate::Poke
+        );
+        assert_eq!(
+            processors.nmi_gate(ap, false, || true, 4001, 100),
+            NmiGate::Stop
+        );
+    }
+
+    /// Late acknowledgements reach one report a period at most, which
+    /// names the longest and counts the rest.
+    #[test]
+    fn late_acknowledgements_are_reported_once_a_period() {
+        let lates = Lates::new();
+        assert_eq!(lates.take(5, 100), None);
+        lates.note(30, 0x10, Doing::Masked, None);
+        lates.note(70, 0x30, Doing::Masked, Some(0xabc));
+        lates.note(50, 0x20, Doing::Job, Some(0));
+        assert_eq!(
+            lates.take(1000, 100),
+            Some(Late {
+                count: 3,
+                ticks: 70,
+                apic: 0x30,
+                doing: Doing::Masked,
+                rip: Some(0xabc),
+            })
+        );
+        // Nothing new: nothing to say; something new within the period
+        // waits for its end.
+        assert_eq!(lates.take(2000, 100), None);
+        lates.note(40, 0x8, Doing::Retiring, Some(0));
+        assert_eq!(lates.take(1050, 100), None);
+        assert_eq!(
+            lates.take(1100, 100),
+            Some(Late {
+                count: 1,
+                ticks: 40,
+                apic: 0x8,
+                doing: Doing::Retiring,
+                rip: Some(0),
+            })
+        );
+    }
+
+    #[test]
+    fn each_sharer_has_a_cache_line_of_its_own() {
+        assert_eq!(core::mem::align_of::<Sharer>(), 64);
+        assert_eq!(core::mem::size_of::<Sharer>(), 64);
+    }
+
+    #[test]
+    fn joins_stop_at_the_processor_cap() {
+        let processors = Processors::new();
+        assert_eq!(processors.join_bsp(0), Some(0));
+        for apic in 1..MAX_PROCESSORS as u32 {
+            assert!(processors.join_ap(apic).is_some());
+        }
+        assert_eq!(processors.join_ap(1000), None);
+    }
+
+    #[test]
+    fn bars_map_through_the_window_that_holds_them() {
+        let windows = [
+            BusWindow {
+                segment: 0,
+                minimum: 0x8000_0000,
+                maximum: 0x8fff_ffff,
+                translation: 0,
+            },
+            BusWindow {
+                segment: 1,
+                minimum: 0x8000_0000,
+                maximum: 0x8fff_ffff,
+                translation: 0x10_0000_0000,
+            },
+        ];
+        assert_eq!(
+            bar_physical(windows, 0, 0x8000_4000, 0x4000),
+            Some(0x8000_4000)
+        );
+        assert_eq!(
+            bar_physical(windows, 1, 0x8000_4000, 0x4000),
+            Some(0x10_8000_4000)
+        );
+        assert_eq!(bar_physical(windows, 0, 0x8fff_f000, 0x2000), None);
+        assert_eq!(bar_physical(windows, 2, 0x8000_0000, 0x1000), None);
+        assert_eq!(bar_physical(windows, 0, 0x8000_0000, 0), None);
+    }
+}

@@ -1,0 +1,338 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 10:17:34 +0000
+Subject: [PATCH] feat(nouveau): sample GSP-RM's P-state and the GPU's PCIe
+ link every second for the host's log, asking RM no more if it refuses the
+ control
+
+---
+ .../drm/nouveau/include/nvkm/core/counts.h    |  26 +++
+ .../gpu/drm/nouveau/include/nvkm/subdev/gsp.h |  11 ++
+ .../nouveau/nvkm/subdev/gsp/rm/r535/Kbuild    |   1 +
+ .../drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c |  10 +-
+ .../nvkm/subdev/gsp/rm/r535/nvrm/perf.h       |  20 +++
+ .../nouveau/nvkm/subdev/gsp/rm/r535/perf.c    | 158 ++++++++++++++++++
+ .../gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h   |   2 +
+ 7 files changed, 225 insertions(+), 3 deletions(-)
+ create mode 100644 drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/nvrm/perf.h
+ create mode 100644 drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/perf.c
+
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/core/counts.h b/drivers/gpu/drm/nouveau/include/nvkm/core/counts.h
+index 46f9ffaa063a3729b18a74afed06468f87c66acc..2bfd1f058e25244f6b0287d41a2055239c935a4e 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/core/counts.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/core/counts.h
+@@ -28,6 +28,32 @@ enum nvkm_count {
+ 
+ extern u64 nvkm_counts[NVKM_COUNTS][3];
+ 
++/*
++ * The GPU's performance state as GSP-RM reports it (gsp/rm/r535/perf.c),
++ * since a host last took it: the rounds that asked RM, the current P-state
++ * as its NV2080_CTRL_PERF_PSTATES bit and every one seen. The status is the
++ * errno of the control RM refused, or -ERANGE for an answer that is not one
++ * P-state, after which it is asked no more. Each round also reads the GPU's
++ * PCIe link: its Link Status and Link Control registers as last read, a bit
++ * per Link Status speed code seen (bit 1 is 2.5 GT/s) and the Link
++ * Capabilities' low word, all zero for a function with no PCIe capability or
++ * a read that failed. A host takes the counts and the speeds seen with atomic
++ * swaps and reads the rest.
++ */
++struct nvkm_perf_report {
++	u32 started;
++	u32 rounds;
++	u32 pstate;
++	u32 pstates;
++	s32 pstate_status;
++	u32 link_status;
++	u32 link_control;
++	u32 link_speeds;
++	u32 link_cap;
++};
++
++extern struct nvkm_perf_report nvkm_perf;
++
+ static inline void
+ nvkm_count_value(enum nvkm_count kind, u64 ns)
+ {
+diff --git a/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h b/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
+index 9abad5a72edb4465d93f296d574929e69d3f67df..5a52f502d3da84e665e195d139a1afd3333ca893 100644
+--- a/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
++++ b/drivers/gpu/drm/nouveau/include/nvkm/subdev/gsp.h
+@@ -219,6 +219,14 @@ struct nvkm_gsp {
+ 	/* The last RPC function RM answered, for the reports at a stop. */
+ 	u32 last_answered;
+ 
++	/* Sampling of RM's performance state (rm/r535/perf.c). */
++	struct {
++		struct delayed_work work;
++		bool armed;
++		/* RM refused the control: it is asked no more. */
++		bool pstate_off;
++	} perf;
++
+ 	/* Internal GSP-RM control handles. */
+ 	struct {
+ 		struct nvkm_gsp_client {
+@@ -299,6 +307,9 @@ static inline void
+ nvkm_gsp_stopping(struct nvkm_gsp *gsp)
+ {
+ 	if (gsp) {
++		/* Its sampling RPCs would be another task's from here on. */
++		if (gsp->perf.armed)
++			cancel_delayed_work_sync(&gsp->perf.work);
+ 		WRITE_ONCE(gsp->stopper, current);
+ 		smp_wmb();
+ 		WRITE_ONCE(gsp->stopping, true);
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/Kbuild b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/Kbuild
+index a5f6b2abfd337f442b715943caabd95895b2ee29..b7626935fab1c104a45cf03867e42bf205f8b594 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/Kbuild
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/Kbuild
+@@ -9,6 +9,7 @@ nvkm-y += nvkm/subdev/gsp/rm/r535/ctrl.o
+ nvkm-y += nvkm/subdev/gsp/rm/r535/alloc.o
+ nvkm-y += nvkm/subdev/gsp/rm/r535/client.o
+ nvkm-y += nvkm/subdev/gsp/rm/r535/device.o
++nvkm-y += nvkm/subdev/gsp/rm/r535/perf.o
+ 
+ nvkm-y += nvkm/subdev/gsp/rm/r535/bar.o
+ nvkm-y += nvkm/subdev/gsp/rm/r535/fbsr.o
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
+index 5b053d3ae4cd94cac1e46543814cf1dad74ef327..d4bb3c3bceefd0e1d8e838dadf152a0729affb70 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/gsp.c
+@@ -1854,6 +1854,8 @@ r535_gsp_fini(struct nvkm_gsp *gsp, enum nvkm_suspend_state suspend)
+ 	struct nvkm_rm *rm = gsp->rm;
+ 	int ret;
+ 
++	r535_gsp_perf_stop(gsp);
++
+ 	if (suspend) {
+ 		u32 len = rm->api->gsp->sr_data_size(gsp);
+ 		GspFwSRMeta *sr;
+@@ -1942,12 +1944,12 @@ done:
+ 		nvkm_gsp_mem_dtor(&gsp->sr.meta);
+ 		nvkm_gsp_radix3_dtor(gsp, &gsp->sr.radix3);
+ 		nvkm_gsp_sg_free(gsp->subdev.device, &gsp->sr.sgt);
+-		return ret;
++	} else if (ret == 0) {
++		ret = r535_gsp_postinit(gsp);
+ 	}
+ 
+ 	if (ret == 0)
+-		ret = r535_gsp_postinit(gsp);
+-
++		r535_gsp_perf_start(gsp);
+ 	return ret;
+ }
+ 
+@@ -2314,6 +2316,8 @@ r535_gsp_libos_debugfs_fini(struct nvkm_gsp __maybe_unused *gsp)
+ void
+ r535_gsp_dtor(struct nvkm_gsp *gsp)
+ {
++	r535_gsp_perf_stop(gsp);
++
+ 	idr_destroy(&gsp->client_id.idr);
+ 	mutex_destroy(&gsp->client_id.mutex);
+ 
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/nvrm/perf.h b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/nvrm/perf.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..978a1f494d9f42a2fe696701dd9dfb60e57c7ded
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/nvrm/perf.h
+@@ -0,0 +1,20 @@
++/* SPDX-License-Identifier: MIT */
++
++/* Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved. */
++
++#ifndef __NVRM_PERF_H__
++#define __NVRM_PERF_H__
++#include <nvrm/nvtypes.h>
++
++/*
++ * Excerpt of RM headers from https://github.com/NVIDIA/open-gpu-kernel-modules/tree/615.78.08,
++ * which GSP-RM 570.144 answers in this layout.
++ */
++
++#define NV2080_CTRL_CMD_PERF_GET_CURRENT_PSTATE (0x20802068) /* finn: Evaluated from "(FINN_NV20_SUBDEVICE_0_PERF_INTERFACE_ID << 8) | NV2080_CTRL_PERF_GET_CURRENT_PSTATE_PARAMS_MESSAGE_ID" */
++
++typedef struct NV2080_CTRL_PERF_GET_CURRENT_PSTATE_PARAMS {
++    NvU32 currPstate;
++} NV2080_CTRL_PERF_GET_CURRENT_PSTATE_PARAMS;
++
++#endif
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/perf.c b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/perf.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..8722a6587a516678e1952628e85956d2f94f4fe3
+--- /dev/null
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/r535/perf.c
+@@ -0,0 +1,158 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * The GPU's performance state as GSP-RM reports it, for a host to read
++ * (include/nvkm/core/counts.h).
++ *
++ * Under GSP-RM, RM's own performance policy picks P-states and clocks from
++ * the GPU's load, and nouveau requests none. A work item asks RM every
++ * R535_GSP_PERF_MS for the current P-state and adds it to nvkm_perf. If RM
++ * refuses the control it is asked no more: RM's error line names it once,
++ * and nvkm_perf keeps the errno, so the host reports the state as unknown
++ * while the rounds go on reading the link.
++ * Clocks are not read: GSP-RM 570.144's RM headers define no clock control
++ * (its ctrl2080clk.h has none), and it refused the 615.78.08 PMUMON layout.
++ *
++ * Each round also reads the GPU's own PCIe Link Status and Link Control, as
++ * RM moves the link speed with the P-state: a link that stays slow while RM
++ * runs at P0 limits every transfer from system memory.
++ */
++#include <rm/rpc.h>
++
++#include <linux/pci.h>
++
++#include <core/counts.h>
++#include <core/pci.h>
++
++#include "nvrm/perf.h"
++
++#define R535_GSP_PERF_MS 1000
++
++struct nvkm_perf_report nvkm_perf;
++
++/* A control RM refused, or answered implausibly: asked no more. */
++static void
++r535_gsp_perf_refused(bool *off, s32 *status, int ret)
++{
++	*off = true;
++	__atomic_store_n(status, ret, __ATOMIC_RELAXED);
++}
++
++/*
++ * Sends ctrl, from nvkm_gsp_rm_ctrl_get(): 0 with RM's answer in place, or
++ * an errno. A refusal is kept unless RM was only busy, and the control is
++ * asked no more.
++ */
++static int
++r535_gsp_perf_push(struct nvkm_gsp_object *subdevice, void **ctrl, u32 size,
++		   bool *off, s32 *status)
++{
++	int ret = nvkm_gsp_rm_ctrl_push(subdevice, ctrl, size);
++
++	/* A transport that answered nothing. */
++	if (!ret && !*ctrl)
++		ret = -EIO;
++	if (ret) {
++		nvkm_gsp_rm_ctrl_done(subdevice, *ctrl);
++		if (ret != -EBUSY && ret != -EAGAIN)
++			r535_gsp_perf_refused(off, status, ret);
++	}
++	return ret;
++}
++
++static void
++r535_gsp_perf_pstate(struct nvkm_gsp *gsp)
++{
++	struct nvkm_gsp_object *subdevice = &gsp->internal.device.subdevice;
++	NV2080_CTRL_PERF_GET_CURRENT_PSTATE_PARAMS *ctrl;
++	u32 pstate;
++
++	ctrl = nvkm_gsp_rm_ctrl_get(subdevice, NV2080_CTRL_CMD_PERF_GET_CURRENT_PSTATE,
++				    sizeof(*ctrl));
++	if (IS_ERR(ctrl)) {
++		r535_gsp_perf_refused(&gsp->perf.pstate_off, &nvkm_perf.pstate_status,
++				      PTR_ERR(ctrl));
++		return;
++	}
++	if (r535_gsp_perf_push(subdevice, (void **)&ctrl, sizeof(*ctrl),
++			       &gsp->perf.pstate_off, &nvkm_perf.pstate_status))
++		return;
++	pstate = ctrl->currPstate;
++	nvkm_gsp_rm_ctrl_done(subdevice, ctrl);
++
++	/* One P-state bit, P0 to P15. */
++	if (!pstate || pstate & ~0xffff || pstate & (pstate - 1)) {
++		r535_gsp_perf_refused(&gsp->perf.pstate_off, &nvkm_perf.pstate_status, -ERANGE);
++		return;
++	}
++	__atomic_store_n(&nvkm_perf.pstate, pstate, __ATOMIC_RELAXED);
++	__atomic_fetch_or(&nvkm_perf.pstates, pstate, __ATOMIC_RELAXED);
++}
++
++/*
++ * The GPU's PCIe link as its own capability reports it, as Linux's
++ * pcie_capability_read_word() reads it; a function with no PCIe capability
++ * or a failed read leaves zeros.
++ */
++static void
++r535_gsp_perf_link(struct nvkm_gsp *gsp)
++{
++	struct nvkm_device *device = gsp->subdev.device;
++	struct pci_dev *pdev;
++	u16 status, control;
++	u32 cap;
++	int pos;
++
++	if (device->type != NVKM_DEVICE_PCI)
++		return;
++	pdev = container_of(device, struct nvkm_device_pci, device)->pdev;
++	pos = pci_pcie_cap(pdev);
++	if (!pos)
++		return;
++	if (pci_read_config_word(pdev, pos + PCI_EXP_LNKSTA, &status) ||
++	    pci_read_config_word(pdev, pos + PCI_EXP_LNKCTL, &control) ||
++	    pci_read_config_dword(pdev, pos + PCI_EXP_LNKCAP, &cap) ||
++	    PCI_POSSIBLE_ERROR(status))
++		return;
++	__atomic_store_n(&nvkm_perf.link_status, status, __ATOMIC_RELAXED);
++	__atomic_store_n(&nvkm_perf.link_control, control, __ATOMIC_RELAXED);
++	__atomic_store_n(&nvkm_perf.link_cap, cap & 0xffff, __ATOMIC_RELAXED);
++	__atomic_fetch_or(&nvkm_perf.link_speeds, BIT(status & PCI_EXP_LNKSTA_CLS),
++			  __ATOMIC_RELAXED);
++}
++
++static void
++r535_gsp_perf_work(struct work_struct *work)
++{
++	struct nvkm_gsp *gsp = container_of(to_delayed_work(work), typeof(*gsp), perf.work);
++
++	/* RPCs from tasks other than the stopping one are refused by then. */
++	if (READ_ONCE(gsp->stopping) || READ_ONCE(gsp->dead) || !gsp->running)
++		return;
++
++	r535_gsp_perf_link(gsp);
++	if (!gsp->perf.pstate_off)
++		r535_gsp_perf_pstate(gsp);
++	__atomic_fetch_add(&nvkm_perf.rounds, 1, __ATOMIC_RELAXED);
++
++	schedule_delayed_work(&gsp->perf.work, msecs_to_jiffies(R535_GSP_PERF_MS));
++}
++
++/* GSP-RM runs: sample its performance state from now on. */
++void
++r535_gsp_perf_start(struct nvkm_gsp *gsp)
++{
++	if (!gsp->perf.armed) {
++		INIT_DELAYED_WORK(&gsp->perf.work, r535_gsp_perf_work);
++		gsp->perf.armed = true;
++	}
++	__atomic_store_n(&nvkm_perf.started, 1, __ATOMIC_RELAXED);
++	schedule_delayed_work(&gsp->perf.work, 0);
++}
++
++/* GSP-RM is about to stop, or stopped answering: sample no more. */
++void
++r535_gsp_perf_stop(struct nvkm_gsp *gsp)
++{
++	if (gsp->perf.armed)
++		cancel_delayed_work_sync(&gsp->perf.work);
++}
+diff --git a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h
+index e9ac47d86b69af51a46a4ab7fa4a395abbf844ac..cefe2d4e1b768f49e325b0ca90e8c5a96e381240 100644
+--- a/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h
++++ b/drivers/gpu/drm/nouveau/nvkm/subdev/gsp/rm/rm.h
+@@ -149,6 +149,8 @@ void r535_gsp_acpi_caps(acpi_handle, CAPS_METHOD_DATA *);
+ struct NV2080_CTRL_CMD_FB_GET_FB_REGION_INFO_PARAMS;
+ void r535_gsp_get_static_info_fb(struct nvkm_gsp *,
+ 				 const struct NV2080_CTRL_CMD_FB_GET_FB_REGION_INFO_PARAMS *);
++void r535_gsp_perf_start(struct nvkm_gsp *);
++void r535_gsp_perf_stop(struct nvkm_gsp *);
+ extern const struct nvkm_rm_api_rpc r535_rpc;
+ extern const struct nvkm_rm_api_ctrl r535_ctrl;
+ extern const struct nvkm_rm_api_alloc r535_alloc;

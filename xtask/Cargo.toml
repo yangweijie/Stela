@@ -1,0 +1,40 @@
+[package]
+name = "xtask"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Stela's development tasks (cargo xtask)"
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+stela-engine.workspace = true
+stela-contracts = { path = "../crates/stela-contracts", default-features = false }
+stela-formats = { path = "../crates/stela-formats", default-features = false }
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+libc.workspace = true
+tempfile.workspace = true
+stela-cli.workspace = true
+stela-compiler.workspace = true
+stela-drivers.workspace = true
+stela-loader.workspace = true
+stela-runtime.workspace = true
+# The LAN peer's frames (`boot::lan::wire`).
+smoltcp = { version = "0.14", default-features = false, features = ["medium-ethernet", "proto-ipv4"] }
+object = { version = "0.37", features = ["read"] }
+plist = "1"
+quick-xml = "0.42"
+sha1 = "0.10"
+sha2.workspace = true
+shlex = "2"
+zip = { version = "4", default-features = false, features = ["deflate"] }
+
+[build-dependencies]
+object = { version = "0.37", features = ["read"] }
+
+[lints]
+workspace = true

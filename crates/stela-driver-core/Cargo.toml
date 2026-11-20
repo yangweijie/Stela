@@ -1,0 +1,20 @@
+[package]
+name = "stela-driver-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Host device firmware and SMBIOS resource contracts"
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+stela-contracts = { path = "../stela-contracts", default-features = false }
+stela-crypto = { path = "../stela-crypto" }
+
+[dev-dependencies]
+# Independent SHA-256 the firmware catalog tests check digests against.
+sha2 = { version = "0.10", default-features = false }

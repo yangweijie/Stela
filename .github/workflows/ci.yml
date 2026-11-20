@@ -1,0 +1,108 @@
+# What a push to main or a pull request must pass: the format of every crate,
+# and the lint and unit tests of the stela command on Linux, Windows and macOS.
+# None needs a built stela.efi: build.rs only embeds one when STELA_EFI names
+# it, so this stays far cheaper than the release workflow.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  # Every commit on main keeps its result; a pull request keeps its newest.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  format:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # No later step pushes, and a pull request's code runs here.
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustc --version
+
+      - name: Format
+        run: |
+          # Every crate, as cargo xtask check formats them.
+          cargo fmt --all -- --check
+          for crate in crates/stela-boot crates/stela-mesa crates/stela-mesa/std; do
+            cargo fmt --manifest-path "$crate/Cargo.toml" -- --check
+          done
+
+  check:
+    name: check (${{ matrix.system }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: linux
+            os: ubuntu-22.04
+          - system: windows
+            os: windows-2025
+          - system: macos
+            os: macos-26
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # No later step pushes, and a pull request's code runs here.
+          persist-credentials: false
+
+      - name: Put LLVM on PATH
+        run: |
+          # The C build passes --no-default-config, which Clang 16 and newer
+          # take; Linux uses the LLVM 21 the boot program builds with.
+          case "$RUNNER_OS" in
+            Windows) echo 'C:\Program Files\LLVM\bin' >> "$GITHUB_PATH" ;;
+            Linux)
+              curl -fsSL https://apt.llvm.org/llvm-snapshot.gpg.key | sudo tee /etc/apt/trusted.gpg.d/apt.llvm.org.asc >/dev/null
+              release="$(lsb_release -cs)"
+              echo "deb http://apt.llvm.org/$release/ llvm-toolchain-$release-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
+              sudo apt-get update -q
+              sudo apt-get install -y -q --no-install-recommends clang-21 llvm-21
+              echo /usr/lib/llvm-21/bin >> "$GITHUB_PATH"
+              ;;
+          esac
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: cargo-ci-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml', 'Cargo.lock') }}
+          restore-keys: cargo-ci-${{ runner.os }}-${{ hashFiles('rust-toolchain.toml') }}-
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install
+          rustc --version
+          clang --version | head -1
+
+      - name: Clippy
+        run: cargo clippy --locked -p stela-cli --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --locked -p stela-cli --lib

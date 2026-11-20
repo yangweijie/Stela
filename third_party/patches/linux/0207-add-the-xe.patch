@@ -1,0 +1,600 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 19:00:00 +0000
+Subject: [PATCH] feat(xe): add the xe driver's Kbuild, the bounded projection
+ of its makefile, and check in the waiver sources its host programmer would
+ generate
+
+---
+ drivers/gpu/drm/xe/Kbuild                     | 331 ++++++++++++++++++
+ .../gpu/drm/xe/generated/xe_device_wa_oob.c   |  17 +
+ .../gpu/drm/xe/generated/xe_device_wa_oob.h   |  23 ++
+ drivers/gpu/drm/xe/generated/xe_wa_oob.c      | 119 +++++++
+ drivers/gpu/drm/xe/generated/xe_wa_oob.h      |  60 ++++
+ 5 files changed, 550 insertions(+)
+ create mode 100644 drivers/gpu/drm/xe/Kbuild
+ create mode 100644 drivers/gpu/drm/xe/generated/xe_device_wa_oob.c
+ create mode 100644 drivers/gpu/drm/xe/generated/xe_device_wa_oob.h
+ create mode 100644 drivers/gpu/drm/xe/generated/xe_wa_oob.c
+ create mode 100644 drivers/gpu/drm/xe/generated/xe_wa_oob.h
+
+diff --git a/drivers/gpu/drm/xe/Kbuild b/drivers/gpu/drm/xe/Kbuild
+new file mode 100644
+index 0000000000000000000000000000000000000000..43af91031f76dc7a1a00a8957402002f4085fdcb
+--- /dev/null
++++ b/drivers/gpu/drm/xe/Kbuild
+@@ -0,0 +1,331 @@
++# SPDX-License-Identifier: GPL-2.0
++# Stela's bounded Kbuild projection of drivers/gpu/drm/xe's build: its upstream
++# Makefile restricted to the Kbuild subset the native port reads. The out-of-
++# subset machinery (hostprogs, generated-source commands, $(obj) pattern rules,
++# hdrtest, Werror, and the KUnit test directories) is dropped; the generated
++# wa_oob sources its hostprog would build are checked in under generated/.
++# Object lists mirror the upstream pin exactly.
++
++# The driver's own tree and its checked-in generated waiver rules:
++ccflags-y += -I $(src)
++# Please keep these build lists sorted!
++# core driver code
++xe-y += xe_bb.o
++xe-y += xe_bo.o
++xe-y += xe_bo_evict.o
++xe-y += xe_dep_scheduler.o
++xe-y += xe_devcoredump.o
++xe-y += xe_device.o
++xe-y += xe_device_sysfs.o
++xe-y += xe_dma_buf.o
++xe-y += xe_drm_client.o
++xe-y += xe_drm_ras.o
++xe-y += xe_eu_stall.o
++xe-y += xe_exec.o
++xe-y += xe_exec_queue.o
++xe-y += xe_execlist.o
++xe-y += xe_force_wake.o
++xe-y += xe_ggtt.o
++xe-y += xe_gpu_scheduler.o
++xe-y += xe_gsc.o
++xe-y += xe_gsc_debugfs.o
++xe-y += xe_gsc_proxy.o
++xe-y += xe_gsc_submit.o
++xe-y += xe_gt.o
++xe-y += xe_gt_ccs_mode.o
++xe-y += xe_gt_clock.o
++xe-y += xe_gt_freq.o
++xe-y += xe_gt_idle.o
++xe-y += xe_gt_mcr.o
++xe-y += xe_gt_sysfs.o
++xe-y += xe_gt_throttle.o
++xe-y += xe_gt_topology.o
++xe-y += xe_guc.o
++xe-y += xe_guc_ads.o
++xe-y += xe_guc_buf.o
++xe-y += xe_guc_capture.o
++xe-y += xe_guc_ct.o
++xe-y += xe_guc_db_mgr.o
++xe-y += xe_guc_engine_activity.o
++xe-y += xe_guc_hwconfig.o
++xe-y += xe_guc_id_mgr.o
++xe-y += xe_guc_klv_helpers.o
++xe-y += xe_guc_log.o
++xe-y += xe_guc_pagefault.o
++xe-y += xe_guc_pc.o
++xe-y += xe_guc_rc.o
++xe-y += xe_guc_submit.o
++xe-y += xe_guc_tlb_inval.o
++xe-y += xe_heci_gsc.o
++xe-y += xe_huc.o
++xe-y += xe_hw_engine.o
++xe-y += xe_hw_engine_class_sysfs.o
++xe-y += xe_hw_engine_group.o
++xe-y += xe_hw_error.o
++xe-y += xe_hw_fence.o
++xe-y += xe_irq.o
++xe-y += xe_late_bind_fw.o
++xe-y += xe_lrc.o
++xe-y += xe_mem_pool.o
++xe-y += xe_migrate.o
++xe-y += xe_mmio.o
++xe-y += xe_mmio_gem.o
++xe-y += xe_mocs.o
++xe-y += xe_module.o
++xe-y += xe_nvm.o
++xe-y += xe_oa.o
++xe-y += xe_observation.o
++xe-y += xe_pagefault.o
++xe-y += xe_page_reclaim.o
++xe-y += xe_pat.o
++xe-y += xe_pci.o
++xe-y += xe_pci_error.o
++xe-y += xe_pci_rebar.o
++xe-y += xe_pcode.o
++xe-y += xe_pm.o
++xe-y += xe_preempt_fence.o
++xe-y += xe_psmi.o
++xe-y += xe_pt.o
++xe-y += xe_pt_walk.o
++xe-y += xe_pxp.o
++xe-y += xe_pxp_debugfs.o
++xe-y += xe_pxp_submit.o
++xe-y += xe_query.o
++xe-y += xe_range_fence.o
++xe-y += xe_ras.o
++xe-y += xe_reg_sr.o
++xe-y += xe_reg_whitelist.o
++xe-y += xe_ring_ops.o
++xe-y += xe_rtp.o
++xe-y += xe_sa.o
++xe-y += xe_sched_job.o
++xe-y += xe_shrinker.o
++xe-y += xe_soc_remapper.o
++xe-y += xe_step.o
++xe-y += xe_survivability_mode.o
++xe-y += xe_sync.o
++xe-y += xe_sysctrl.o
++xe-y += xe_sysctrl_event.o
++xe-y += xe_sysctrl_mailbox.o
++xe-y += xe_tile.o
++xe-y += xe_tile_sysfs.o
++xe-y += xe_tlb_inval.o
++xe-y += xe_tlb_inval_job.o
++xe-y += xe_trace.o
++xe-y += xe_trace_bo.o
++xe-y += xe_trace_guc.o
++xe-y += xe_trace_lrc.o
++xe-y += xe_ttm_stolen_mgr.o
++xe-y += xe_ttm_sys_mgr.o
++xe-y += xe_ttm_vram_mgr.o
++xe-y += xe_tuning.o
++xe-y += xe_uc.o
++xe-y += xe_uc_fw.o
++xe-y += xe_validation.o
++xe-y += xe_vm.o
++xe-y += xe_vm_madvise.o
++xe-y += xe_vram.o
++xe-y += xe_vram_freq.o
++xe-y += xe_vsec.o
++xe-y += xe_wa.o
++xe-y += xe_wait_user_fence.o
++xe-y += xe_wopcm.o
++xe-$(CONFIG_I2C) += xe_i2c.o
++xe-$(CONFIG_I2C) += xe_amc.o
++xe-$(CONFIG_DRM_XE_GPUSVM) += xe_svm.o
++xe-$(CONFIG_DRM_GPUSVM) += xe_userptr.o
++# graphics hardware monitoring (HWMON) support
++xe-$(CONFIG_HWMON) += xe_hwmon.o
++xe-$(CONFIG_PERF_EVENTS) += xe_pmu.o
++xe-$(CONFIG_CONFIGFS_FS) += xe_configfs.o
++# graphics virtualization (SR-IOV) support
++xe-y += xe_gt_sriov_vf.o
++xe-y += xe_guc_relay.o
++xe-y += xe_memirq.o
++xe-y += xe_sriov.o
++xe-y += xe_sriov_vf.o
++xe-y += xe_sriov_vf_ccs.o
++xe-y += xe_tile_sriov_vf.o
++xe-$(CONFIG_PCI_IOV) += xe_gt_sriov_pf.o
++xe-$(CONFIG_PCI_IOV) += xe_gt_sriov_pf_config.o
++xe-$(CONFIG_PCI_IOV) += xe_gt_sriov_pf_control.o
++xe-$(CONFIG_PCI_IOV) += xe_gt_sriov_pf_migration.o
++xe-$(CONFIG_PCI_IOV) += xe_gt_sriov_pf_monitor.o
++xe-$(CONFIG_PCI_IOV) += xe_gt_sriov_pf_policy.o
++xe-$(CONFIG_PCI_IOV) += xe_gt_sriov_pf_service.o
++xe-$(CONFIG_PCI_IOV) += xe_lmtt.o
++xe-$(CONFIG_PCI_IOV) += xe_lmtt_2l.o
++xe-$(CONFIG_PCI_IOV) += xe_lmtt_ml.o
++xe-$(CONFIG_PCI_IOV) += xe_mert.o
++xe-$(CONFIG_PCI_IOV) += xe_pci_sriov.o
++xe-$(CONFIG_PCI_IOV) += xe_sriov_packet.o
++xe-$(CONFIG_PCI_IOV) += xe_sriov_pf.o
++xe-$(CONFIG_PCI_IOV) += xe_sriov_pf_control.o
++xe-$(CONFIG_PCI_IOV) += xe_sriov_pf_debugfs.o
++xe-$(CONFIG_PCI_IOV) += xe_sriov_pf_migration.o
++xe-$(CONFIG_PCI_IOV) += xe_sriov_pf_provision.o
++xe-$(CONFIG_PCI_IOV) += xe_sriov_pf_service.o
++xe-$(CONFIG_PCI_IOV) += xe_sriov_pf_sysfs.o
++xe-$(CONFIG_PCI_IOV) += xe_tile_sriov_pf_debugfs.o
++ifdef CONFIG_XE_VFIO_PCI
++xe-$(CONFIG_PCI_IOV) += xe_sriov_vfio.o
++endif
++# include helpers for tests even when XE is built-in
++ifdef CONFIG_DRM_XE_KUNIT_TEST
++xe-y += tests/xe_kunit_helpers.o
++endif
++# i915 Display compat #defines and #includes
++ifdef CONFIG_DRM_XE_DISPLAY
++# The i915 display compat headers, and the shared display library's include
++# path: i915/display is a sibling of xe in the drm tree. Upstream gates these
++# on the display option as a subdir ccflags; the subset's ifdef mirrors it.
++ccflags-y += -I $(src)/compat-i915-headers
++ccflags-y += -I $(src)/../i915/display
++endif
++
++# Display code specific to xe
++xe-$(CONFIG_DRM_XE_DISPLAY) += display/xe_display.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += display/xe_display_bo.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += display/xe_display_pcode.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += display/xe_display_rpm.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += display/xe_display_wa.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += display/xe_dsb_buffer.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += display/xe_fb_pin.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += display/xe_frontbuffer.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += display/xe_hdcp_gsc.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += display/xe_initial_plane.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += display/xe_panic.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += display/xe_stolen.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += display/xe_tdf.o
++# Display code shared with i915
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/icl_dsi.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_alpm.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_atomic.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_audio.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_backlight.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_bios.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_bo.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_bw.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_casf.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_cdclk.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_cmtg.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_color.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_colorop.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_color_pipeline.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_combo_phy.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_connector.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_crtc.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_crtc_state_dump.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_cursor.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_cx0_phy.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_dbuf_bw.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_ddi.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_ddi_buf_trans.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_de.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_display.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_display_conversion.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_display_device.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_display_driver.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_display_irq.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_display_params.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_display_power.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_display_power_map.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_display_power_well.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_display_reset.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_display_rpm.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_display_rps.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_display_trace.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_display_utils.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_display_wa.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_dkl_phy.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_dmc.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_dmc_wl.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_dp.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_dp_aux.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_dp_aux_backlight.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_dp_hdcp.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_dp_link_caps.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_dp_link_training.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_dp_mst.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_dp_test.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_dpll.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_dpll_mgr.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_dpt.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_dram.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_drrs.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_dsb.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_dsi.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_dsi_dcs_backlight.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_dsi_vbt.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_encoder.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_fb.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_fbc.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_fdi.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_fifo_underrun.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_flipq.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_frontbuffer.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_global_state.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_gmbus.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_hdcp.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_hdcp_gsc_message.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_hdmi.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_hotplug.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_hotplug_irq.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_hti.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_initial_plane.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_link_bw.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_lspcon.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_lt_phy.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_mchbar.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_modeset_lock.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_modeset_setup.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_modeset_verify.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_overlay.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_panel.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_parent.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_pch.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_pfit.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_plane.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_pmdemand.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_pps.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_psr.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_qp_tables.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_quirks.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_rom.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_snps_hdmi_pll.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_snps_phy.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_tc.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_vblank.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_vdsc.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_vga.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_vrr.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_wm.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/skl_prefill.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/skl_scaler.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/skl_universal_plane.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/skl_watermark.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/vlv_sideband.o
++ifdef CONFIG_ACPI
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_acpi.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_opregion.o
++endif
++ifdef CONFIG_DRM_FBDEV_EMULATION
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_fbdev.o
++endif
++ifdef CONFIG_DEBUG_FS
++xe-y += xe_debugfs.o
++xe-y += xe_gt_debugfs.o
++xe-y += xe_gt_sriov_vf_debugfs.o
++xe-y += xe_gt_stats.o
++xe-y += xe_guc_debugfs.o
++xe-y += xe_huc_debugfs.o
++xe-y += xe_tile_debugfs.o
++xe-y += xe_uc_debugfs.o
++xe-$(CONFIG_PCI_IOV) += xe_gt_sriov_pf_debugfs.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_display_debugfs.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_display_debugfs_params.o
++xe-$(CONFIG_DRM_XE_DISPLAY) += i915-display/intel_pipe_crc.o
++endif
++xe-$(CONFIG_DRM_XE_DP_TUNNEL) += i915-display/intel_dp_tunnel.o
++
++obj-$(CONFIG_DRM_XE) += xe.o
+diff --git a/drivers/gpu/drm/xe/generated/xe_device_wa_oob.c b/drivers/gpu/drm/xe/generated/xe_device_wa_oob.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..6e1414687f31a39fa5fad782f759cb44a8d81c30
+--- /dev/null
++++ b/drivers/gpu/drm/xe/generated/xe_device_wa_oob.c
+@@ -0,0 +1,17 @@
++{ XE_RTP_NAME("22010954014"),
++  XE_RTP_RULES(PLATFORM(DG2)) },
++{ XE_RTP_NAME("15015404425"),
++  XE_RTP_RULES(    PLATFORM(LUNARLAKE), OR,
++	PLATFORM(PANTHERLAKE)) },
++{ XE_RTP_NAME("22019338487_display"),
++  XE_RTP_RULES(PLATFORM(LUNARLAKE)) },
++{ XE_RTP_NAME("14022085890"),
++  XE_RTP_RULES(SUBPLATFORM(BATTLEMAGE, G21)) },
++{ XE_RTP_NAME("14026539277"),
++  XE_RTP_RULES(PLATFORM(NOVALAKE_P), PLATFORM_STEP(A0, B0)) },
++{ XE_RTP_NAME("14026633728"),
++  XE_RTP_RULES(PLATFORM(CRESCENTISLAND)) },
++{ XE_RTP_NAME("14026746987"),
++  XE_RTP_RULES(PLATFORM(CRESCENTISLAND)) },
++{ XE_RTP_NAME("14026779378"),
++  XE_RTP_RULES(PLATFORM(CRESCENTISLAND)) },
+diff --git a/drivers/gpu/drm/xe/generated/xe_device_wa_oob.h b/drivers/gpu/drm/xe/generated/xe_device_wa_oob.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..97ad6d90d093e60224e267d6afb39d431de2ea23
+--- /dev/null
++++ b/drivers/gpu/drm/xe/generated/xe_device_wa_oob.h
+@@ -0,0 +1,23 @@
++// SPDX-License-Identifier: MIT
++
++/*
++ * DO NOT MODIFY.
++ *
++ * This file was generated from rules: xe_device_wa_oob.rules
++ */
++#ifndef _GENERATED_XE_DEVICE_WA_OOB_
++#define _GENERATED_XE_DEVICE_WA_OOB_
++
++enum {
++	XE_DEVICE_WA_OOB_22010954014 = 0,
++	XE_DEVICE_WA_OOB_15015404425 = 1,
++	XE_DEVICE_WA_OOB_22019338487_display = 2,
++	XE_DEVICE_WA_OOB_14022085890 = 3,
++	XE_DEVICE_WA_OOB_14026539277 = 4,
++	XE_DEVICE_WA_OOB_14026633728 = 5,
++	XE_DEVICE_WA_OOB_14026746987 = 6,
++	XE_DEVICE_WA_OOB_14026779378 = 7,
++	_XE_DEVICE_WA_OOB_COUNT = 8
++};
++
++#endif
+diff --git a/drivers/gpu/drm/xe/generated/xe_wa_oob.c b/drivers/gpu/drm/xe/generated/xe_wa_oob.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..47fc2673e66ca381a034b9f20bd6e03d64427cc1
+--- /dev/null
++++ b/drivers/gpu/drm/xe/generated/xe_wa_oob.c
+@@ -0,0 +1,119 @@
++{ XE_RTP_NAME("1607983814"),
++  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(1200, 1210)) },
++{ XE_RTP_NAME("16010904313"),
++  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(1200, 1210)) },
++{ XE_RTP_NAME("18022495364"),
++  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(1200, 1210)) },
++{ XE_RTP_NAME("22012773006"),
++  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(1200, 1250)) },
++{ XE_RTP_NAME("14014475959"),
++  XE_RTP_RULES(PLATFORM(DG2)) },
++{ XE_RTP_NAME("22011391025"),
++  XE_RTP_RULES(PLATFORM(DG2)) },
++{ XE_RTP_NAME("22012727170"),
++  XE_RTP_RULES(SUBPLATFORM(DG2, G11)) },
++{ XE_RTP_NAME("22012727685"),
++  XE_RTP_RULES(SUBPLATFORM(DG2, G11)) },
++{ XE_RTP_NAME("22016596838"),
++  XE_RTP_RULES(PLATFORM(PVC)) },
++{ XE_RTP_NAME("18020744125"),
++  XE_RTP_RULES(PLATFORM(PVC)) },
++{ XE_RTP_NAME("1409600907"),
++  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(1200, 1250)) },
++{ XE_RTP_NAME("22014953428"),
++  XE_RTP_RULES(SUBPLATFORM(DG2, G10), OR,
++	SUBPLATFORM(DG2, G12)) },
++{ XE_RTP_NAME("16017236439"),
++  XE_RTP_RULES(PLATFORM(PVC)) },
++{ XE_RTP_NAME("14019821291"),
++  XE_RTP_RULES(MEDIA_VERSION_RANGE(1300, 2000)) },
++{ XE_RTP_NAME("14015076503"),
++  XE_RTP_RULES(MEDIA_VERSION(1300)) },
++{ XE_RTP_NAME("14018913170"),
++  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(1270, 1274), OR,
++	MEDIA_VERSION(1300), OR,
++	PLATFORM(DG2)) },
++{ XE_RTP_NAME("14018094691"),
++  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(2001, 2002), OR,
++	GRAPHICS_VERSION(2004)) },
++{ XE_RTP_NAME("18024947630"),
++  XE_RTP_RULES(GRAPHICS_VERSION(2001), OR,
++	GRAPHICS_VERSION(2004), OR,
++	MEDIA_VERSION(2000)) },
++{ XE_RTP_NAME("16022287689"),
++  XE_RTP_RULES(GRAPHICS_VERSION(2001), OR,
++	GRAPHICS_VERSION(2004)) },
++{ XE_RTP_NAME("13011645652"),
++  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(2004, 3005)) },
++{ XE_RTP_NAME("14022293748"),
++  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(2001, 3005)) },
++{ XE_RTP_NAME("22019794406"),
++  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(2001, 3005)) },
++{ XE_RTP_NAME("22019338487"),
++  XE_RTP_RULES(MEDIA_VERSION(2000), OR,
++	GRAPHICS_VERSION(2001), FUNC(xe_rtp_match_not_sriov_vf), OR,
++	MEDIA_VERSION(3000), MEDIA_STEP(A0, B0), FUNC(xe_rtp_match_not_sriov_vf)) },
++{ XE_RTP_NAME("16023588340"),
++  XE_RTP_RULES(GRAPHICS_VERSION(2001), FUNC(xe_rtp_match_not_sriov_vf)) },
++{ XE_RTP_NAME("14019789679"),
++  XE_RTP_RULES(GRAPHICS_VERSION(1255), OR,
++	GRAPHICS_VERSION_RANGE(1270, 2004)) },
++{ XE_RTP_NAME("14022866841"),
++  XE_RTP_RULES(GRAPHICS_VERSION(3000), GRAPHICS_STEP(A0, B0), OR,
++	MEDIA_VERSION(3000), MEDIA_STEP(A0, B0)) },
++{ XE_RTP_NAME("16021333562"),
++  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(1200, 1274), OR,
++	MEDIA_VERSION(1300)) },
++{ XE_RTP_NAME("14016712196"),
++  XE_RTP_RULES(GRAPHICS_VERSION(1255), OR,
++	GRAPHICS_VERSION_RANGE(1270, 1274)) },
++{ XE_RTP_NAME("14015568240"),
++  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(1255, 1260)) },
++{ XE_RTP_NAME("18013179988"),
++  XE_RTP_RULES(GRAPHICS_VERSION(1255), OR,
++	GRAPHICS_VERSION_RANGE(1270, 1274)) },
++{ XE_RTP_NAME("1508761755"),
++  XE_RTP_RULES(GRAPHICS_VERSION(1255)) },
++{ XE_RTP_NAME("16023105232"),
++  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(2001, 3005), OR,
++	MEDIA_VERSION_RANGE(1301, 3002)) },
++{ XE_RTP_NAME("16026508708"),
++  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(1200, 3005), OR,
++	MEDIA_VERSION_RANGE(1300, 3002)) },
++{ XE_RTP_NAME("14020001231"),
++  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(2001,2004), FUNC(xe_rtp_match_psmi_enabled), OR,
++	MEDIA_VERSION_RANGE(2000, 3002), FUNC(xe_rtp_match_psmi_enabled)) },
++{ XE_RTP_NAME("16023683509"),
++  XE_RTP_RULES(MEDIA_VERSION(2000), FUNC(xe_rtp_match_psmi_enabled), OR,
++	MEDIA_VERSION(3000), MEDIA_STEP(A0, B0), FUNC(xe_rtp_match_psmi_enabled)) },
++{ XE_RTP_NAME("14025515070"),
++  XE_RTP_RULES(GRAPHICS_VERSION(2004), OR,
++	MEDIA_VERSION_RANGE(1301, 3000), OR,
++	MEDIA_VERSION(3002), OR,
++	GRAPHICS_VERSION_RANGE(3000, 3001), OR,
++	GRAPHICS_VERSION_RANGE(3003, 3005), OR,
++	MEDIA_VERSION(3500), OR,
++	GRAPHICS_VERSION(3510), GRAPHICS_STEP(A0, B0)) },
++{ XE_RTP_NAME("15015404425_disable"),
++  XE_RTP_RULES(PLATFORM(PANTHERLAKE), MEDIA_STEP(B0, FOREVER)) },
++{ XE_RTP_NAME("16026007364"),
++  XE_RTP_RULES(   MEDIA_VERSION(3000)) },
++{ XE_RTP_NAME("14020316580"),
++  XE_RTP_RULES(   MEDIA_VERSION(1301)) },
++{ XE_RTP_NAME("14025883347"),
++  XE_RTP_RULES(MEDIA_VERSION_RANGE(1301, 3500), OR,
++	GRAPHICS_VERSION_RANGE(2004, 3005)) },
++{ XE_RTP_NAME("16029380221"),
++  XE_RTP_RULES(MEDIA_VERSION(3500)) },
++{ XE_RTP_NAME("22022079272"),
++  XE_RTP_RULES(MEDIA_VERSION(3503), OR,
++	GRAPHICS_VERSION(3510), OR,
++	GRAPHICS_VERSION(3511)) },
++{ XE_RTP_NAME("16029897822"),
++  XE_RTP_RULES(MEDIA_VERSION(3500), OR,
++	GRAPHICS_VERSION(3510)) },
++{ XE_RTP_NAME("14027054324"),
++  XE_RTP_RULES(GRAPHICS_VERSION(3511)) },
++{ XE_RTP_NAME("14025941587"),
++  XE_RTP_RULES(GRAPHICS_VERSION_RANGE(2001, 3511), FUNC(xe_rtp_match_not_sriov_vf), OR,
++	MEDIA_VERSION_RANGE(1301, 3503), FUNC(xe_rtp_match_not_sriov_vf)) },
+diff --git a/drivers/gpu/drm/xe/generated/xe_wa_oob.h b/drivers/gpu/drm/xe/generated/xe_wa_oob.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..8fef59f773f38aee61881306b38f7fedb772efbf
+--- /dev/null
++++ b/drivers/gpu/drm/xe/generated/xe_wa_oob.h
+@@ -0,0 +1,60 @@
++// SPDX-License-Identifier: MIT
++
++/*
++ * DO NOT MODIFY.
++ *
++ * This file was generated from rules: xe_wa_oob.rules
++ */
++#ifndef _GENERATED_XE_WA_OOB_
++#define _GENERATED_XE_WA_OOB_
++
++enum {
++	XE_WA_OOB_1607983814 = 0,
++	XE_WA_OOB_16010904313 = 1,
++	XE_WA_OOB_18022495364 = 2,
++	XE_WA_OOB_22012773006 = 3,
++	XE_WA_OOB_14014475959 = 4,
++	XE_WA_OOB_22011391025 = 5,
++	XE_WA_OOB_22012727170 = 6,
++	XE_WA_OOB_22012727685 = 7,
++	XE_WA_OOB_22016596838 = 8,
++	XE_WA_OOB_18020744125 = 9,
++	XE_WA_OOB_1409600907 = 10,
++	XE_WA_OOB_22014953428 = 11,
++	XE_WA_OOB_16017236439 = 12,
++	XE_WA_OOB_14019821291 = 13,
++	XE_WA_OOB_14015076503 = 14,
++	XE_WA_OOB_14018913170 = 15,
++	XE_WA_OOB_14018094691 = 16,
++	XE_WA_OOB_18024947630 = 17,
++	XE_WA_OOB_16022287689 = 18,
++	XE_WA_OOB_13011645652 = 19,
++	XE_WA_OOB_14022293748 = 20,
++	XE_WA_OOB_22019794406 = 21,
++	XE_WA_OOB_22019338487 = 22,
++	XE_WA_OOB_16023588340 = 23,
++	XE_WA_OOB_14019789679 = 24,
++	XE_WA_OOB_14022866841 = 25,
++	XE_WA_OOB_16021333562 = 26,
++	XE_WA_OOB_14016712196 = 27,
++	XE_WA_OOB_14015568240 = 28,
++	XE_WA_OOB_18013179988 = 29,
++	XE_WA_OOB_1508761755 = 30,
++	XE_WA_OOB_16023105232 = 31,
++	XE_WA_OOB_16026508708 = 32,
++	XE_WA_OOB_14020001231 = 33,
++	XE_WA_OOB_16023683509 = 34,
++	XE_WA_OOB_14025515070 = 35,
++	XE_WA_OOB_15015404425_disable = 36,
++	XE_WA_OOB_16026007364 = 37,
++	XE_WA_OOB_14020316580 = 38,
++	XE_WA_OOB_14025883347 = 39,
++	XE_WA_OOB_16029380221 = 40,
++	XE_WA_OOB_22022079272 = 41,
++	XE_WA_OOB_16029897822 = 42,
++	XE_WA_OOB_14027054324 = 43,
++	XE_WA_OOB_14025941587 = 44,
++	_XE_WA_OOB_COUNT = 45
++};
++
++#endif

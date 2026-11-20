@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tyler Smith <74526874+tylertms@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 19:08:35 +0000
+Subject: [PATCH] nir/opt_barrier_modes: keep the modes of memory accessed
+ without derefs
+
+The pass kept a barrier's mode only for deref accesses it does not
+dominate, so in a shader whose memory accesses are explicit intrinsics,
+as after nir_lower_explicit_io, it dropped every memory mode. A fence
+left without modes or an execution scope is then removed (NAK's
+nak_nir_remove_barriers does), so device-scope fences and the barriers
+of acquire and release atomics vanished. Global, SSBO, shared and image
+intrinsics without derefs now keep their mode as a deref access does.
+---
+ src/compiler/nir/nir_opt_barriers.c | 67 ++++++++++++++++++++++++++++-
+ 1 file changed, 66 insertions(+), 1 deletion(-)
+
+diff --git a/src/compiler/nir/nir_opt_barriers.c b/src/compiler/nir/nir_opt_barriers.c
+index 271ae6a5c4e5f9a9e37071e9e139a0093b1f370d..43f07e2ac38c2e909f214052a31e3b377f40febc 100644
+--- a/src/compiler/nir/nir_opt_barriers.c
++++ b/src/compiler/nir/nir_opt_barriers.c
+@@ -320,6 +320,46 @@ barrier_happens_before(const nir_instr *a, const nir_instr *b)
+    return nir_block_dominates(a->block, b->block);
+ }
+ 
++/* The memory an intrinsic accesses through an address rather than a deref,
++ * as it does once nir_lower_explicit_io has run, or 0. */
++static nir_variable_mode
++explicit_access_modes(const nir_intrinsic_instr *intrin)
++{
++   switch (intrin->intrinsic) {
++   case nir_intrinsic_load_global:
++   case nir_intrinsic_load_global_constant:
++   case nir_intrinsic_load_global_bounded:
++   case nir_intrinsic_load_global_constant_bounded:
++   case nir_intrinsic_store_global:
++   case nir_intrinsic_global_atomic:
++   case nir_intrinsic_global_atomic_swap:
++      return nir_var_mem_global;
++   case nir_intrinsic_load_ssbo:
++   case nir_intrinsic_store_ssbo:
++   case nir_intrinsic_ssbo_atomic:
++   case nir_intrinsic_ssbo_atomic_swap:
++      return nir_var_mem_ssbo;
++   case nir_intrinsic_load_shared:
++   case nir_intrinsic_store_shared:
++   case nir_intrinsic_shared_atomic:
++   case nir_intrinsic_shared_atomic_swap:
++      return nir_var_mem_shared;
++   case nir_intrinsic_image_load:
++   case nir_intrinsic_image_sparse_load:
++   case nir_intrinsic_image_store:
++   case nir_intrinsic_image_atomic:
++   case nir_intrinsic_image_atomic_swap:
++   case nir_intrinsic_bindless_image_load:
++   case nir_intrinsic_bindless_image_sparse_load:
++   case nir_intrinsic_bindless_image_store:
++   case nir_intrinsic_bindless_image_atomic:
++   case nir_intrinsic_bindless_image_atomic_swap:
++      return nir_var_image;
++   default:
++      return 0;
++   }
++}
++
+ static bool
+ nir_opt_barrier_modes_impl(nir_function_impl *impl)
+ {
+@@ -334,6 +374,14 @@ nir_opt_barrier_modes_impl(nir_function_impl *impl)
+       nir_instr_worklist_fini(&barriers);
+       return false;
+    }
++   /* Accesses without derefs, each of which keeps its memory's mode in a
++    * barrier that does not happen before it. */
++   struct u_vector mem_accesses;
++   if (!u_vector_init(&mem_accesses, 32, sizeof(struct nir_intrinsic_instr *))) {
++      u_vector_finish(&mem_derefs);
++      nir_instr_worklist_fini(&barriers);
++      return false;
++   }
+ 
+    const unsigned all_memory_modes = nir_var_image |
+                                      nir_var_mem_ssbo |
+@@ -347,6 +395,10 @@ nir_opt_barrier_modes_impl(nir_function_impl *impl)
+ 
+             if (intrin->intrinsic == nir_intrinsic_barrier)
+                nir_instr_worklist_push_tail(&barriers, instr);
++            else if (explicit_access_modes(intrin)) {
++               nir_intrinsic_instr **tail = u_vector_add(&mem_accesses);
++               *tail = intrin;
++            }
+ 
+          } else if (instr->type == nir_instr_type_deref) {
+             nir_deref_instr *deref = nir_instr_as_deref(instr);
+@@ -389,6 +441,17 @@ nir_opt_barrier_modes_impl(nir_function_impl *impl)
+             new_modes |= deref_modes;
+       }
+ 
++      nir_intrinsic_instr **p_access;
++      u_vector_foreach(p_access, &mem_accesses)
++      {
++         const nir_variable_mode access_modes =
++            explicit_access_modes(*p_access) & barrier_modes;
++
++         if (access_modes &&
++             !barrier_happens_before(&barrier->instr, &(*p_access)->instr))
++            new_modes |= access_modes;
++      }
++
+       /* If we don't need all the modes, update the barrier. */
+       if (barrier_modes != new_modes) {
+          nir_intrinsic_set_memory_modes(barrier, new_modes);
+@@ -408,6 +471,7 @@ nir_opt_barrier_modes_impl(nir_function_impl *impl)
+ 
+    nir_instr_worklist_fini(&barriers);
+    u_vector_finish(&mem_derefs);
++   u_vector_finish(&mem_accesses);
+ 
+    return progress;
+ }
+@@ -415,7 +479,8 @@ nir_opt_barrier_modes_impl(nir_function_impl *impl)
+ /**
+  * Reduce barriers to remove unnecessary modes and scope.
+  *
+- * This pass must be called before nir_lower_explicit_io lowers derefs!
++ * Memory accessed through derefs and through the explicit intrinsics
++ * nir_lower_explicit_io makes both keep their modes.
+  *
+  * Many shaders issue full memory barriers, which may need to synchronize
+  * access to images, SSBOs, shared local memory, or global memory.  However,

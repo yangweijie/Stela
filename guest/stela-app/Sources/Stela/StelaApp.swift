@@ -1,0 +1,75 @@
+// Native macOS application entry point. Other hosts can build and test the inspection library.
+#if os(macOS)
+  import AppKit
+  import SwiftUI
+
+  @main
+  @MainActor
+  struct StelaApp: App {
+    @StateObject private var model = AppModel()
+
+    init() {
+      NSApplication.shared.setActivationPolicy(.regular)
+    }
+
+    var body: some Scene {
+      Window("Stela", id: "main") {
+        ContentView(model: model)
+          .frame(minWidth: 640, minHeight: 600)
+          .task {
+            NSApplication.shared.applicationIconImage = Brand.icon
+            await model.refresh()
+            await PreviewRenderer.renderIfRequested(model: model)
+          }
+      }
+      .defaultSize(Style.window)
+      .windowResizability(.contentMinSize)
+      Window("About This PC", id: AboutThisPC.window) {
+        ThisPCView(model: model).frame(width: 340).fixedSize()
+      }
+      .windowResizability(.contentSize)
+      .defaultPosition(.center)
+      .commands {
+        CommandGroup(replacing: .appInfo) { AboutThisPC() }
+        CommandGroup(replacing: .newItem) {}
+        CommandMenu("System") {
+          Button("Refresh System Information") { Task { await model.refresh() } }
+            .keyboardShortcut("r")
+            .disabled(model.refreshing)
+          Divider()
+          Button("Copy System Report", action: model.copyReport)
+            .keyboardShortcut("c", modifiers: [.command, .shift])
+            .disabled(model.snapshot == nil)
+          Button("Export System Report…", action: model.exportReport)
+            .keyboardShortcut("e", modifiers: [.command, .shift])
+            .disabled(model.snapshot == nil)
+          Divider()
+          Button("Inspect Stela Setup…", action: model.inspectSetup)
+          Button("Open System Information…") { model.openSystemApp("System Information") }
+        }
+      }
+    }
+  }
+
+  /// The app menu's About item, opening the compact This PC window.
+  struct AboutThisPC: View {
+    static let window = "about-this-pc"
+    @Environment(\.openWindow) private var openWindow
+
+    var body: some View {
+      Button("About This PC") { openWindow(id: Self.window) }
+    }
+  }
+#else
+  import Foundation
+
+  @main
+  enum UnsupportedPlatform {
+    static func main() {
+      fputs(
+        "Stela.app requires macOS 13 or later. The inspection library can be tested on this platform.\n",
+        stderr)
+      exit(1)
+    }
+  }
+#endif

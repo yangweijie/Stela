@@ -1,0 +1,310 @@
+//! Barriers, events and hints: DSB, ISB, SB, WFE/WFI, SEV, YIELD, NOP and others.
+
+const BARRIER_MASK: u32 = 0xffff_f0ff;
+const DSB_CLASS: u32 = 0xd503_309f;
+const DSB_NXS_MASK: u32 = 0xffff_f3ff;
+const DSB_NXS_CLASS: u32 = 0xd503_323f;
+const ISB_CLASS: u32 = 0xd503_30df;
+const SB_CLASS: u32 = 0xd503_30ff;
+const OPTION_SHIFT: u32 = 8;
+const OPTION_MASK: u32 = 15;
+const NXS_SCOPE_SHIFT: u32 = 10;
+const SCOPE_MASK: u32 = 3;
+const REQUIREMENT_MASK: u8 = 3;
+const READS_OPTION: u8 = 1;
+const WRITES_OPTION: u8 = 2;
+const SSBB_OPTION: u8 = 0;
+const PSSBB_OPTION: u8 = 4;
+const BTI_MASK: u32 = 0xffff_ff3f;
+const BTI_CLASS: u32 = 0xd503_241f;
+const BTI_TARGET_SHIFT: u32 = 6;
+const BTI_TARGET_MASK: u32 = 3;
+const WFXT_MASK: u32 = 0xffff_ffe0;
+const WFET_CLASS: u32 = 0xd503_1000;
+const WFIT_CLASS: u32 = 0xd503_1020;
+const REGISTER_MASK: u32 = 31;
+const HINT_MASK: u32 = 0xffff_f01f;
+const HINT_CLASS: u32 = 0xd503_201f;
+const HINT_IMMEDIATE_SHIFT: u32 = 5;
+const HINT_IMMEDIATE_MASK: u32 = 127;
+const YIELD: u32 = 0xd503_203f;
+const WFE: u32 = 0xd503_205f;
+const WFI: u32 = 0xd503_207f;
+const SEV: u32 = 0xd503_209f;
+const SEVL: u32 = 0xd503_20bf;
+const ESB: u32 = 0xd503_221f;
+const TSB: u32 = 0xd503_225f;
+const CSDB: u32 = 0xd503_229f;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Requirement {
+    All,
+    Reads,
+    Writes,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitKind {
+    Event,
+    Interrupt,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Operation {
+    /// DSB. Its shareability domain (CRm<3:2>, or CRm<3:2> of the nXS
+    /// form) selects nothing here: every PE shares one coherent host
+    /// memory, so each domain completes as Full system.
+    DataCompletion {
+        option: u8,
+        requirement: Requirement,
+        nxs: bool,
+    },
+    StoreBypassBarrier {
+        physical: bool,
+    },
+    InstructionSynchronization {
+        option: u8,
+    },
+    SpeculationBarrier,
+    ConsumptionBarrier,
+    Yield,
+    BranchTarget {
+        targets: u8,
+    },
+    SendEvent {
+        local: bool,
+    },
+    Wait {
+        kind: WaitKind,
+        timeout_register: Option<u8>,
+    },
+    ErrorSynchronization,
+    TraceSynchronization,
+    // Delegated to the complete hint dispatcher, never emitted as generic NOP.
+    OtherHint {
+        immediate: u8,
+    },
+}
+
+pub fn decode(word: u32) -> Option<Operation> {
+    // All the modeled hint, barrier and timed-wait forms share this class.
+    if word >> 16 != 0xd503 {
+        return None;
+    }
+    if word & BARRIER_MASK == DSB_CLASS {
+        let option = ((word >> OPTION_SHIFT) & OPTION_MASK) as u8;
+        if option == SSBB_OPTION || option == PSSBB_OPTION {
+            return Some(Operation::StoreBypassBarrier {
+                physical: option == PSSBB_OPTION,
+            });
+        }
+        let requirement = match option & REQUIREMENT_MASK {
+            READS_OPTION => Requirement::Reads,
+            WRITES_OPTION => Requirement::Writes,
+            _ => Requirement::All,
+        };
+        return Some(Operation::DataCompletion {
+            option,
+            requirement,
+            nxs: false,
+        });
+    }
+    if word & DSB_NXS_MASK == DSB_NXS_CLASS {
+        let encoded_scope = (word >> NXS_SCOPE_SHIFT) & SCOPE_MASK;
+        return Some(Operation::DataCompletion {
+            option: encoded_scope as u8,
+            requirement: Requirement::All,
+            nxs: true,
+        });
+    }
+    if word & BARRIER_MASK == ISB_CLASS {
+        return Some(Operation::InstructionSynchronization {
+            option: ((word >> OPTION_SHIFT) & OPTION_MASK) as u8,
+        });
+    }
+    if word & BARRIER_MASK == SB_CLASS {
+        // CRm is should-be-zero, not an architectural operand. This profile
+        // selects the permitted execute-as-zero outcome for nonzero bits.
+        return Some(Operation::SpeculationBarrier);
+    }
+    if word & BTI_MASK == BTI_CLASS {
+        return Some(Operation::BranchTarget {
+            targets: ((word >> BTI_TARGET_SHIFT) & BTI_TARGET_MASK) as u8,
+        });
+    }
+    let timed_wait = match word & WFXT_MASK {
+        WFET_CLASS => Some(WaitKind::Event),
+        WFIT_CLASS => Some(WaitKind::Interrupt),
+        _ => None,
+    };
+    if let Some(kind) = timed_wait {
+        return Some(Operation::Wait {
+            kind,
+            timeout_register: Some((word & REGISTER_MASK) as u8),
+        });
+    }
+    Some(match word {
+        YIELD => Operation::Yield,
+        WFE => Operation::Wait {
+            kind: WaitKind::Event,
+            timeout_register: None,
+        },
+        WFI => Operation::Wait {
+            kind: WaitKind::Interrupt,
+            timeout_register: None,
+        },
+        SEV => Operation::SendEvent { local: false },
+        SEVL => Operation::SendEvent { local: true },
+        ESB => Operation::ErrorSynchronization,
+        TSB => Operation::TraceSynchronization,
+        CSDB => Operation::ConsumptionBarrier,
+        _ if word & HINT_MASK == HINT_CLASS => Operation::OtherHint {
+            immediate: ((word >> HINT_IMMEDIATE_SHIFT) & HINT_IMMEDIATE_MASK) as u8,
+        },
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_isb_option_keeps_its_raw_option() {
+        for option in 0..=OPTION_MASK {
+            assert_eq!(
+                decode(ISB_CLASS | option << OPTION_SHIFT),
+                Some(Operation::InstructionSynchronization {
+                    option: option as u8
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn every_sb_crm_selects_execute_as_zero_policy() {
+        for option in 0..=OPTION_MASK {
+            assert_eq!(
+                decode(SB_CLASS | option << OPTION_SHIFT),
+                Some(Operation::SpeculationBarrier)
+            );
+        }
+    }
+
+    #[test]
+    fn dsb_aliases_do_not_become_completion_fences() {
+        for (option, physical) in [(SSBB_OPTION, false), (PSSBB_OPTION, true)] {
+            assert_eq!(
+                decode(DSB_CLASS | u32::from(option) << OPTION_SHIFT),
+                Some(Operation::StoreBypassBarrier { physical })
+            );
+        }
+        for option in [8, 12] {
+            assert_eq!(
+                decode(DSB_CLASS | option << OPTION_SHIFT),
+                Some(Operation::DataCompletion {
+                    option: option as u8,
+                    requirement: Requirement::All,
+                    nxs: false
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_dsb_options_match_the_source_table() {
+        use Requirement::{All, Reads, Writes};
+        // Options0/4 are the separately tested SSBB/PSSBB aliases.
+        let expected = [
+            (1, Reads),
+            (2, Writes),
+            (3, All),
+            (5, Reads),
+            (6, Writes),
+            (7, All),
+            (8, All),
+            (9, Reads),
+            (10, Writes),
+            (11, All),
+            (12, All),
+            (13, Reads),
+            (14, Writes),
+            (15, All),
+        ];
+        for (option, requirement) in expected {
+            assert_eq!(
+                decode(DSB_CLASS | u32::from(option) << OPTION_SHIFT),
+                Some(Operation::DataCompletion {
+                    option,
+                    requirement,
+                    nxs: false
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn every_nxs_scope_keeps_nxs() {
+        for encoded_scope in 0..=SCOPE_MASK {
+            assert_eq!(
+                decode(DSB_NXS_CLASS | encoded_scope << NXS_SCOPE_SHIFT),
+                Some(Operation::DataCompletion {
+                    option: encoded_scope as u8,
+                    requirement: Requirement::All,
+                    nxs: true
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn bti_keeps_every_target_kind() {
+        for targets in 0..=BTI_TARGET_MASK {
+            assert_eq!(
+                decode(BTI_CLASS | targets << BTI_TARGET_SHIFT),
+                Some(Operation::BranchTarget {
+                    targets: targets as u8
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn timed_waits_keep_all_registers_including_zero() {
+        for (class, kind) in [
+            (WFET_CLASS, WaitKind::Event),
+            (WFIT_CLASS, WaitKind::Interrupt),
+        ] {
+            for register in 0..=REGISTER_MASK {
+                assert_eq!(
+                    decode(class | register),
+                    Some(Operation::Wait {
+                        kind,
+                        timeout_register: Some(register as u8)
+                    })
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn other_hint_slots_require_delegation_and_never_become_nop() {
+        for immediate in [0, 7, 8, 19, 22, 39, 40, 48, 127] {
+            assert_eq!(
+                decode(HINT_CLASS | immediate << HINT_IMMEDIATE_SHIFT),
+                Some(Operation::OtherHint {
+                    immediate: immediate as u8
+                })
+            );
+        }
+        // The adjacent DMB and CLREX encodings belong to other families.
+        for word in [
+            0xd503_3fbf,
+            0xd503_3f5f,
+            0xd503_203e,
+            0xd503_103f ^ (1 << 8),
+        ] {
+            assert_eq!(decode(word), None);
+        }
+    }
+}

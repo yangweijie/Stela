@@ -1,0 +1,82 @@
+[package]
+name = "stela-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+# Stela's source here is GPL-2.0-or-later. The `stela` binary links Apache-2.0
+# crates and no GPL-2.0-only code, so it is distributed as a whole under
+# GPL-3.0-or-later (NOTICE).
+description = "The stela command: prepares the USB installer that boots macOS on a PC through Stela"
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "stela"
+path = "src/main.rs"
+
+[dependencies]
+stela-gpu-maintenance.workspace = true
+stela-soc-data = { path = "../stela-soc-data", default-features = false }
+stela-engine = { path = "../stela-engine" }
+stela-contracts = { path = "../stela-contracts" }
+stela-formats = { path = "../stela-formats", default-features = false }
+anyhow.workspace = true
+clap.workspace = true
+serde = { workspace = true, features = ["std"] }
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+tempfile.workspace = true
+stela-drivers.workspace = true
+stela-boot-core.workspace = true
+stela-soc.workspace = true
+stela-runtime.workspace = true
+stela-loader.workspace = true
+aes = "0.8"
+base64 = "0.22"
+ctr = "0.9"
+getrandom = "0.2"
+hkdf = "0.12"
+hmac = "0.12"
+hpke ={ version = "0.13", default-features = false, features = ["alloc", "p256"] }
+p256 = { version = "0.13", features = ["pkcs8", "pem"] }
+plist = "1"
+zeroize = "1"
+libc.workspace = true
+sha1 = "0.10"
+zip = { version = "4", default-features = false, features = ["deflate"] }
+cliclack = "0.5"
+indicatif = "0.18"
+console = "0.16"
+
+# HTTPS through the operating system's TLS and trust store on Windows
+# (SChannel) and macOS (Security.framework), and through rustls with the
+# webpki roots elsewhere.
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "native-tls"] }
+
+[target.'cfg(not(any(windows, target_os = "macos")))'.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+
+# Setup's disk backend on Windows: storage and volume control codes.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_Foundation",
+    "Win32_Globalization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
+
+
+[lints]
+workspace = true

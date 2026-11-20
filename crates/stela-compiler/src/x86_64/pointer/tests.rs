@@ -1,0 +1,462 @@
+use super::*;
+
+/// The tag words of these tests.
+const TAGS: Place = Place::new(Anchor::Mirrors, 0);
+
+#[test]
+fn forms_name_their_key_kind_operands_and_completion() {
+    let form = Form::of(Operation::SignIbSp).unwrap();
+    assert_eq!(
+        (form.key, form.kind, form.pointer, form.modifier),
+        (key_index(Key::Ib), SIGNED, 30, Modifier::StackPointer)
+    );
+    assert_eq!(requested(form.request()), (Key::Ib, false, false));
+    let branch = Form::of(Operation::Branch {
+        key: Key::Ia,
+        target: 8,
+        modifier: Modifier::Register(16),
+        link: true,
+    })
+    .unwrap();
+    assert_eq!(branch.completion, Finish::Branch { link: true });
+    assert_eq!(branch.kind, AUTHENTICATED);
+    assert_eq!(requested(branch.request()), (Key::Ia, true, true));
+    let plain = Form::of(Operation::Authenticate {
+        key: Key::Db,
+        destination: 3,
+        modifier: Modifier::Zero,
+    })
+    .unwrap();
+    assert_eq!(requested(plain.request()), (Key::Db, true, false));
+    let ret = Form::of(Operation::ReturnIbSp).unwrap();
+    assert_eq!(requested(ret.request()), (Key::Ib, true, true));
+    let code = |destination, source, modifier| {
+        Form::of(Operation::GenericCode(
+            crate::block::pauth_memory::GenericCode {
+                destination,
+                source,
+                modifier,
+            },
+        ))
+    };
+    let generic = code(1, 2, 31).unwrap();
+    assert_eq!(
+        (
+            generic.key,
+            generic.pointer,
+            generic.result,
+            generic.modifier
+        ),
+        (GENERIC_KEY, 2, 1, Modifier::StackPointer)
+    );
+    assert!(requests_generic_code(generic.request()));
+    assert!(!requests_generic_code(form.request()));
+    assert!(code(1, 31, 3).is_none() && code(31, 2, 3).is_none());
+    // Register 31 operands and the other PAC forms stay with the engine.
+    assert!(
+        Form::of(Operation::Sign {
+            key: Key::Da,
+            destination: 31,
+            modifier: Modifier::Zero,
+        })
+        .is_none()
+    );
+    assert!(
+        Form::of(Operation::Strip {
+            data: true,
+            destination: 0
+        })
+        .is_none()
+    );
+}
+
+/// A thunk's service call ends as `--profile`'s host samples look for it
+/// before a return address; a block's call through the cell is checked in
+/// `inline`'s tests.
+#[test]
+fn thunk_service_calls_end_as_host_samples_look_for_them() {
+    const SERVICE: u64 = 0xffff_8000_1234_5678;
+    let [cell, address] = service_call_ends(0x48, SERVICE);
+    let form = Form::of(Operation::SignIbSp).unwrap();
+    let code = thunk(form, GuestAddress(0x1000), TAGS, SERVICE).code;
+    let contains = |code: &[u8], end: &[u8]| code.windows(end.len()).any(|bytes| bytes == end);
+    assert!(contains(&code, &address));
+    assert!(!contains(&code, &cell));
+    // Each ends with its call: `call rax`, `call [rdi + 0x48]`.
+    assert!(address.ends_with(&[0xff, 0xd0]));
+    assert!(cell.ends_with(&[0xff, 0x57, 0x48]));
+}
+
+#[test]
+fn tags_keep_generation_key_and_kind_apart() {
+    assert_eq!(tag(1, 3, AUTHENTICATED), 0x132);
+    // A zero tag word matches no entry of any generation, nor of the
+    // disabled word; the disabled word's entries no tag's.
+    for kind in [SIGNED, AUTHENTICATED] {
+        assert!(tag(1, 0, SIGNED) > kind && DISABLED | SIGNED > kind);
+        for generation in [0, 1, u64::MAX >> 8] {
+            for key in 0..=GENERIC_KEY {
+                assert_ne!(tag(generation, key, 0), DISABLED);
+                assert_ne!(tag(generation, key, kind), DISABLED | kind);
+            }
+        }
+    }
+    assert!(slot(u64::MAX, u64::MAX) < MEMO_ENTRIES);
+    assert_eq!(slot(0x1234, 0x5678) % MEMO_WAYS, 0);
+}
+
+/// Return addresses a few instructions apart signed with stack pointers a
+/// few frames apart (equal sums, which a call tree makes all the time)
+/// spread over the sets, and a set keeps its two most recent entries.
+#[test]
+fn memo_sets_spread_call_trees_and_keep_two_entries() {
+    use alloc::collections::BTreeSet;
+    let mut sets = BTreeSet::new();
+    let mut pairs = 0;
+    for site in 0..64u64 {
+        for depth in 0..16u64 {
+            let lr = 0x1_9a49_8000 + 0x10 * site;
+            let sp = 0x16f_dff0_0000 - 0x10 * (site + depth);
+            sets.insert(slot(lr, sp));
+            pairs += 1;
+        }
+    }
+    // Sums repeat across those pairs; the sets must not.
+    assert!(
+        sets.len() * 100 >= pairs * 97,
+        "{} sets for {pairs}",
+        sets.len()
+    );
+    let mut memo = alloc::vec![MemoEntry::default(); MEMO_ENTRIES];
+    let entry = |pointer: u64, value: u64| MemoEntry {
+        pointer,
+        modifier: 0x8000,
+        tag: tag(1, 0, SIGNED),
+        value,
+    };
+    // Three operand pairs in one set: the newest two stay.
+    let first = slot(0x4000, 0x8000);
+    let mut same = (0x4000..).step_by(4).filter(|&p| slot(p, 0x8000) == first);
+    let (a, b, c) = (
+        same.next().unwrap(),
+        same.next().unwrap(),
+        same.next().unwrap(),
+    );
+    insert(&mut memo, entry(a, 1));
+    insert(&mut memo, entry(b, 2));
+    assert_eq!(memo[first..first + 2], [entry(b, 2), entry(a, 1)]);
+    // Refilling an entry replaces it where it is.
+    insert(&mut memo, entry(a, 3));
+    assert_eq!(memo[first..first + 2], [entry(b, 2), entry(a, 3)]);
+    insert(&mut memo, entry(c, 4));
+    assert_eq!(memo[first..first + 2], [entry(c, 4), entry(b, 2)]);
+}
+
+/// Thunks run on the host: hits complete each form without the service,
+/// misses ask it on an aligned stack and complete what it completes, and
+/// a refusal (as of a cleared tag word, which no entry matches) exits with
+/// no write.
+#[cfg(all(target_arch = "x86_64", any(target_os = "macos", target_os = "linux")))]
+#[test]
+fn thunks_complete_hits_and_computed_misses_natively() {
+    use crate::GuestState;
+    use alloc::vec;
+    use core::ffi::c_void;
+    use core::sync::atomic::{AtomicU64, Ordering::SeqCst};
+    unsafe extern "C" {
+        fn mmap(
+            address: *mut c_void,
+            bytes: usize,
+            protection: i32,
+            flags: i32,
+            fd: i32,
+            offset: i64,
+        ) -> *mut c_void;
+        fn mprotect(address: *mut c_void, bytes: usize, protection: i32) -> i32;
+        fn munmap(address: *mut c_void, bytes: usize) -> i32;
+    }
+    #[cfg(target_os = "macos")]
+    const MAP_ANONYMOUS: i32 = 0x1000;
+    #[cfg(target_os = "linux")]
+    const MAP_ANONYMOUS: i32 = 0x20;
+    const PAGE: usize = 4096;
+    #[repr(C)]
+    #[derive(Debug, PartialEq, Eq)]
+    struct Exit {
+        pc: u64,
+        kind: u64,
+    }
+    // The service's calls, their last arguments, the stack alignment
+    // they saw and the answer they give.
+    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static STATE: AtomicU64 = AtomicU64::new(0);
+    static REQUEST: AtomicU64 = AtomicU64::new(0);
+    static OPERANDS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    static MISALIGNED: AtomicU64 = AtomicU64::new(0);
+    static ANSWER: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    extern "sysv64" fn service(
+        state: u64,
+        request: u32,
+        pointer: u64,
+        modifier: u64,
+    ) -> Completion {
+        // A u128 (16-byte aligned on x86-64) is at an aligned address
+        // only in an aligned frame.
+        const _: () = assert!(core::mem::align_of::<u128>() == 16);
+        let local = core::hint::black_box(0u128);
+        let address = core::hint::black_box(&raw const local) as u64;
+        MISALIGNED.fetch_add(address & 15, SeqCst);
+        CALLS.fetch_add(1, SeqCst);
+        STATE.store(state, SeqCst);
+        REQUEST.store(u64::from(request), SeqCst);
+        OPERANDS[0].store(pointer, SeqCst);
+        OPERANDS[1].store(modifier, SeqCst);
+        Completion {
+            completed: ANSWER[0].load(SeqCst),
+            value: ANSWER[1].load(SeqCst),
+        }
+    }
+    fn run(code: &[u8], state: &mut GuestState, misaligned: bool) -> Exit {
+        // A misaligned run enters 8 bytes lower: Rust calls arrive with
+        // RSP 8 mod 16, blocks run at 0 mod 16.
+        let mut bytes = vec![];
+        if misaligned {
+            bytes.extend([0x48, 0x83, 0xec, 0x08]); // sub rsp,8
+            bytes.push(0xe8); // call the thunk, after the next 5 bytes
+            bytes.extend(5i32.to_le_bytes());
+            bytes.extend([0x48, 0x83, 0xc4, 0x08, 0xc3]); // add rsp,8; ret
+        }
+        bytes.extend(crate::x86_64::pinned::entered(code));
+        // SAFETY: private anonymous memory, RX after the copy, unmapped
+        // after the call; the thunk touches only `state`, the memo, the
+        // tags and the stack, and calls `service`.
+        unsafe {
+            let page = mmap(core::ptr::null_mut(), PAGE, 3, 2 | MAP_ANONYMOUS, -1, 0);
+            assert_ne!(page as usize, usize::MAX);
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), page.cast(), bytes.len());
+            assert_eq!(mprotect(page, PAGE, 5), 0);
+            let entry = |state: *mut crate::GuestState| -> Exit {
+                crate::x86_64::native::call::<Exit>(page as *const u8, state, 0, 0)
+            };
+            let exit = entry(state);
+            assert_eq!(munmap(page, PAGE), 0);
+            exit
+        }
+    }
+    let pc = GuestAddress(0x4000);
+    let (pointer, modifier, value) = (0xffff_fe00_1234_5678, 0xffff_fe00_0000_8000, 0xabcd);
+    // Native code reads both through their addresses, so Rust writes
+    // them through the same pointers.
+    let mut memo = vec![MemoEntry::default(); MEMO_ENTRIES];
+    let mut tags = [0u64; 4];
+    let (memo, tags) = (memo.as_mut_ptr(), tags.as_mut_ptr());
+    // SAFETY: key_index produces 0..4 and tags outlives these synchronous thunk calls.
+    let set_tag = |key: u8, value: u64| unsafe { tags.add(usize::from(key)).write(value) };
+    // SAFETY: slot masks into MEMO_ENTRIES; each returned borrow ends before native execution.
+    let entry = |index: usize| unsafe { &mut *memo.add(index) };
+    let routine: ServiceRoutine = service;
+    let make = |operation| {
+        thunk(
+            Form::of(operation).unwrap(),
+            pc,
+            TAGS,
+            routine as usize as u64,
+        )
+    };
+    let mut state = GuestState::default();
+    state.anchors[Anchor::Memo] = memo as u64;
+    state.anchors[Anchor::Mirrors] = tags as u64;
+    state.anchors[Anchor::Pointer] = 0x5e41;
+    // PACIBSP: X30 signed with SP.
+    let ib = key_index(Key::Ib);
+    *entry(slot(pointer, modifier)) = MemoEntry {
+        pointer,
+        modifier,
+        tag: tag(1, ib, SIGNED),
+        value,
+    };
+    let sign = make(Operation::SignIbSp);
+    state.x[30] = pointer;
+    state.sp = modifier;
+    let miss = Exit {
+        pc: pc.0,
+        kind: ExitKind::PointerAuthentication as u64,
+    };
+    assert_eq!(run(&sign.code, &mut state, false), miss, "a zero tag word");
+    assert_eq!((state.x[30], CALLS.load(SeqCst)), (pointer, 1));
+    set_tag(ib, tag(1, ib, 0));
+    let next = Exit {
+        pc: pc.0 + 4,
+        kind: ExitKind::Fallthrough as u64,
+    };
+    assert_eq!(run(&sign.code, &mut state, false), next);
+    assert_eq!((state.x[30], CALLS.load(SeqCst)), (value, 1));
+    // Another modifier misses the memo: the service refuses, then
+    // completes, on either stack alignment.
+    state.x[30] = pointer;
+    state.sp = modifier + 16;
+    assert_eq!(run(&sign.code, &mut state, true), miss);
+    assert_eq!(state.x[30], pointer);
+    assert_eq!(
+        (
+            STATE.load(SeqCst),
+            REQUEST.load(SeqCst),
+            OPERANDS[0].load(SeqCst),
+            OPERANDS[1].load(SeqCst)
+        ),
+        (0x5e41, u64::from(ib), pointer, modifier + 16)
+    );
+    ANSWER[0].store(1, SeqCst);
+    ANSWER[1].store(0x1357, SeqCst);
+    for misaligned in [false, true] {
+        state.x[30] = pointer;
+        assert_eq!(run(&sign.code, &mut state, misaligned), next);
+        assert_eq!(state.x[30], 0x1357);
+    }
+    assert_eq!((CALLS.load(SeqCst), MISALIGNED.load(SeqCst)), (4, 0));
+    // An authentication of the memo's signing operands misses too.
+    state.x[30] = pointer;
+    state.sp = modifier;
+    let authenticate = make(Operation::AuthenticateIbSp);
+    assert_eq!(run(&authenticate.code, &mut state, false), next);
+    assert_eq!(
+        REQUEST.load(SeqCst),
+        u64::from(u32::from(ib) | REQUEST_AUTHENTICATE)
+    );
+    // BLRAA X8, X16 and RETAA take their branch with the result.
+    let ia = key_index(Key::Ia);
+    set_tag(ia, tag(1, ia, 0));
+    entry(slot(pointer, modifier)).tag = tag(1, ia, AUTHENTICATED);
+    let call = make(Operation::Branch {
+        key: Key::Ia,
+        target: 8,
+        modifier: Modifier::Register(16),
+        link: true,
+    });
+    state.x[8] = pointer;
+    state.x[16] = modifier;
+    let taken = |pc, kind: ExitKind| Exit {
+        pc,
+        kind: kind as u64,
+    };
+    let calls = CALLS.load(SeqCst);
+    assert_eq!(
+        run(&call.code, &mut state, false),
+        taken(value, ExitKind::Call)
+    );
+    assert_eq!((state.x[8], state.x[30]), (pointer, pc.0 + 4));
+    state.x[30] = pointer;
+    let ret = make(Operation::ReturnIaSp);
+    assert_eq!(
+        run(&ret.code, &mut state, false),
+        taken(value, ExitKind::Return)
+    );
+    assert_eq!((state.x[30], CALLS.load(SeqCst)), (pointer, calls));
+    // A computed branch result, from a missed combined request.
+    state.x[16] = modifier ^ 1;
+    assert_eq!(
+        run(&call.code, &mut state, false),
+        taken(0x1357, ExitKind::Call)
+    );
+    assert_eq!(
+        REQUEST.load(SeqCst),
+        u64::from(u32::from(ia) | REQUEST_AUTHENTICATE | REQUEST_COMBINED)
+    );
+    // A disabled key's results, the pointers unchanged, are the memo's
+    // under its tag word as the service remembers them, whatever the key:
+    // PACIBSP leaves X30, BLRAA branches to X8 itself.
+    let calls = CALLS.load(SeqCst);
+    set_tag(ib, DISABLED);
+    state.x[30] = pointer;
+    state.sp = modifier + 32;
+    *entry(slot(pointer, modifier + 32)) = MemoEntry {
+        pointer,
+        modifier: modifier + 32,
+        tag: DISABLED | SIGNED,
+        value: pointer,
+    };
+    assert_eq!(run(&sign.code, &mut state, false), next);
+    assert_eq!(state.x[30], pointer);
+    set_tag(ia, DISABLED);
+    state.x[16] = modifier;
+    *entry(slot(pointer, modifier)) = MemoEntry {
+        pointer,
+        modifier,
+        tag: DISABLED | AUTHENTICATED,
+        value: pointer,
+    };
+    state.x[30] = 0;
+    assert_eq!(
+        run(&call.code, &mut state, false),
+        taken(pointer, ExitKind::Call)
+    );
+    assert_eq!((state.x[8], state.x[30]), (pointer, pc.0 + 4));
+    assert_eq!(CALLS.load(SeqCst), calls);
+}
+
+/// `mov [rdi+disp32],rax`.
+const REGISTER_WRITE_BYTES: usize = 7;
+/// The second opcode bytes of `jz` and `jnz` with a 32-bit displacement.
+const JZ: u8 = 0x84;
+const JNZ: u8 = 0x85;
+
+#[test]
+fn register_completions_chain_onward_and_misses_exit_unchanged() {
+    use super::super::chain::{DIRECT_EXIT_BYTES, DYNAMIC_EXIT_BYTES};
+    let pc = GuestAddress(0x4000);
+    let form = Form::of(Operation::SignIbSp).unwrap();
+    let thunk = thunk(form, pc, TAGS, 0x4000);
+    let end = thunk.code.len();
+    assert_eq!(
+        thunk.code[end - DIRECT_EXIT_BYTES..],
+        super::super::chain::direct_exit(pc, ExitKind::PointerAuthentication)
+    );
+    let next = thunk.next.unwrap();
+    // Padded for its patch point, wherever it lands.
+    assert!(super::super::chain::is_direct_exit(
+        &thunk.code[next..next + DIRECT_EXIT_BYTES],
+        GuestAddress(0x4004),
+        ExitKind::Fallthrough
+    ));
+    // The refused service lands on the exit; the second entry's three
+    // misses on the service call, just after the completion, whose JMP
+    // back to the register write precedes the exit; the first entry's two
+    // misses go to the second entry and its hit to the shared load, both
+    // before the completion. No branch tests the tag word.
+    let complete = next - REGISTER_WRITE_BYTES;
+    let (mut exits, mut calls, mut within) = (0, 0, 0);
+    for at in 0..end - 6 {
+        if thunk.code[at] == 0x0f && [JZ, JNZ].contains(&thunk.code[at + 1]) {
+            let relative =
+                i32::from_le_bytes(thunk.code[at + 2..at + 6].try_into().unwrap()) as usize;
+            match at + 6 + relative {
+                target if target == end - DIRECT_EXIT_BYTES => exits += 1,
+                target if target == next + DIRECT_EXIT_BYTES => calls += 1,
+                target if target > at && target < complete => within += 1,
+                target => panic!("a jump to {target}"),
+            }
+        }
+    }
+    assert_eq!((exits, calls, within), (1, 3, 3));
+    let back = end - DIRECT_EXIT_BYTES - 5;
+    assert_eq!(thunk.code[back], 0xe9);
+    let relative = i32::from_le_bytes(thunk.code[back + 1..back + 5].try_into().unwrap());
+    assert_eq!((back as i64 + 5 + i64::from(relative)) as usize, complete);
+    assert_eq!(thunk.dynamic, None);
+    // A return completes at its exit to the target in RAX, which the
+    // service path reaches too.
+    let ret = Form::of(Operation::ReturnIaSp).unwrap();
+    let ret = super::thunk(ret, pc, TAGS, 0x4000);
+    assert_eq!(ret.next, None);
+    let returns = ret.dynamic.unwrap();
+    // Padded for its patch point, wherever it lands.
+    assert!(super::super::chain::is_dynamic_exit(
+        &ret.code[returns..returns + DYNAMIC_EXIT_BYTES],
+        ExitKind::Return
+    ));
+    // The service's `jmp complete` precedes the final exit.
+    let back = ret.code.len() - DIRECT_EXIT_BYTES - 5;
+    assert_eq!(ret.code[back], 0xe9);
+    let relative = i32::from_le_bytes(ret.code[back + 1..back + 5].try_into().unwrap());
+    assert_eq!((back as i64 + 5 + i64::from(relative)) as usize, returns);
+}
